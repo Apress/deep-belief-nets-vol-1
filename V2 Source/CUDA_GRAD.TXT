@@ -1,0 +1,218 @@
+/*
+--------------------------------------------------------------------------------
+
+   gradient_cuda - Compute the gradient for the entire training set
+
+--------------------------------------------------------------------------------
+*/
+
+double CpxAuto::gradient_cuda (
+   int nc ,             // Number of cases
+   int nin ,            // Number of (possibly complex) inputs
+   double *input ,      // Nc by max_neurons input matrix
+   int nout ,           // Number of (possibly complex) outputs
+   double *target ,     // Nc by nout target matrix, or autoencoding if NULL
+   int n_layers ,       // Number of layers, including output (Number of hidden is one less than this)
+   int *nhid ,          // Number of hidden neurons in each layer
+   int n_weights ,      // Total (actual) number of weights, including final layer and bias
+   double *weights[] ,  // Weight matrices for layers
+   int use_final_layer_weights , // Use final_layer_weights (vs last weight layer)?
+   double *grad         // Concatenated gradient vector, which is computed here
+   )
+{
+   int i, k, n, ilayer, ineuron, ivar, ret_val, ibatch, n_in_batch, n_subsets, istart, istop, n_done, max_batch ;
+   int n_prior, gradlen, nin_this_layer, timer, n_last_layer_weights, mult ;
+   double mse, wpen, *wptr, *gptr, *last_layer_weights ;
+   char msg[256] ;
+
+   assert ( n_layers >= 2 ) ;  // Use CUDA only if at least one hidden layer
+
+   mult = is_complex  ?  2 : 1 ;
+
+   if (use_final_layer_weights) {                      // Full CpxAuto model
+      assert ( target != NULL ) ;
+      last_layer_weights = final_layer_weights ;
+      n_last_layer_weights = n_final_layer_weights ;   // Per output, not total; If complex, this is actual
+      }
+
+   else {                                              // Greedily training an autoencoder
+      assert ( target == NULL ) ;                      // which may or may not be complex
+      last_layer_weights = weights[n_layers-1] ;
+      n_last_layer_weights = mult * (nhid[n_layers-2] + 1) ;
+      }
+
+// Setup pointers to gradient for each layer
+   gptr = grad ;
+
+   for (ilayer=0 ; ilayer<n_layers ; ilayer++) {
+      grad_ptr[ilayer] = gptr ;
+
+      if (ilayer == 0  &&  n_layers == 1) {          // Direct input to output?
+         n = nout * mult * (nin+1) ;                 // This many inputs to each neuron in this layer
+         gptr += n ;                                 // Not needed, but it illustrates the process
+         }
+
+      else if (ilayer == 0) {                        // First hidden layer?
+         n = nhid[ilayer] * mult * (nin+1) ;         // This many inputs to each neuron in this layer
+         gptr += n ;
+         }
+
+      else if (ilayer < n_layers-1) {                   // Subsequent hidden layer?
+         n = nhid[ilayer] * mult * (nhid[ilayer-1]+1) ; // This many inputs to each neuron in this layer
+         gptr += n ;
+         }
+
+      else
+         n = nout * mult * (nhid[ilayer-1]+1) ;         // Not needed but illustrates process
+      } // For all layers, including output
+
+/*
+   In order to prevent integer overflow in allocating memory for the gradient
+   we compute the minimum number of batches needed to get each batch small enough.
+*/
+
+   gradlen = 0 ;
+   n_prior = nin ;
+   for (i=0 ; i<n_layers-1 ; i++) {   // Hidden layers
+      gradlen += mult * nhid[i] * (n_prior + 1) ;
+      n_prior = nhid[i] ;
+      }
+   gradlen += mult * nout * (n_prior + 1) ;    // Output layer
+   assert ( gradlen == n_weights ) ;
+
+   max_batch = MAXPOSNUM / (gradlen * sizeof(float)) ;  // Memory allocation size
+   if (max_batch > 65535)                               // Grid dimension
+      max_batch = 65535 ;
+   if (max_batch > nc)
+      max_batch = nc ;
+   n_subsets = nc / max_batch + 1 ;    // The +1 is required
+
+   if (n_subsets < TrainParams.n_subsets)  // Allow user to increase to prevent Windows timeout
+      n_subsets = TrainParams.n_subsets ;
+
+   if (n_subsets > nc) {  // Happens only if user specifies a huge model for a tiny dataset
+      ... Issue error message and abort
+      }
+
+/*
+   Initialize CUDA device if not yet done for this session
+
+   Programming WARNING... If ANY of the parameters in the call to cpx_cuda_init change,
+                          then cpx_cuda_cleanup MUST be called and init redone!
+*/
+
+   if (! cpx_cuda_initialized) {
+
+      n_done = 0 ;         // Must find max batch size for cuda init
+      for (ibatch=0 ; ibatch<n_subsets ; ibatch++) {
+         n_in_batch = (nc - n_done) / (n_subsets - ibatch) ;   // Cases left to do / batches left to do
+         if (ibatch == 0  ||  n_in_batch > max_batch)
+            max_batch = n_in_batch ;
+         n_done += n_in_batch ;
+         }
+
+      cpx_cuda_init ( is_complex , classifier && (target != NULL) , class_ids ,
+                      nc , nin , max_neurons , input ,
+                      nout , target , max_batch , n_layers , nhid , msg ) ;
+
+      cpx_cuda_initialized = 1 ;
+      }
+
+
+   if (cuda_weights_changed) {
+      cuda_cpx_weights_to_device ( nin , nout , n_layers , nhid , weights , last_layer_weights ) ;
+      cuda_weights_changed = 0 ;
+      }
+
+/*
+   Gradient computation starts here
+*/
+
+   for (i=0 ; i<n_weights ; i++)
+      grad[i] = 0.0 ;
+
+   istart = 0 ;         // Batch start = training data start
+   n_done = 0 ;         // Number of training cases done in this epoch so far
+
+   for (ibatch=0 ; ibatch<n_subsets ; ibatch++) {
+      n_in_batch = (nc - n_done) / (n_subsets - ibatch) ;   // Cases left to do / batches left to do
+      istop = istart + n_in_batch ;                         // Stop just before this index
+
+/*
+   Forward pass
+*/
+
+      for (ilayer=0 ; ilayer<n_layers-1 ; ilayer++)
+         cuda_cpx_hidden_activation ( istart , istop , nhid[ilayer] , ilayer , 1 ) ;
+
+      cuda_cpx_output_activation ( istart , istop , nout ) ;
+
+      if (classifier && (target != NULL))
+         cuda_cpx_softmax ( istart , istop ) ;
+
+/*
+   Backward pass
+*/
+
+      cuda_cpx_output_delta ( istart , istop , classifier && (target != NULL) , nout ) ;
+      cuda_cpx_output_gradient ( n_in_batch , nhid[n_layers-2] , n_layers-2 , nout ) ;
+
+      for (ilayer=n_layers-2 ; ilayer>0 ; ilayer--)
+         cuda_cpx_subsequent_hidden_gradient ( n_in_batch , ilayer ,
+                 nhid[ilayer] , nhid[ilayer-1] , ilayer==n_layers-2 ) ;
+
+      cuda_cpx_first_hidden_gradient ( istart , istop , nin , nhid[0] , n_layers==2 ) ;
+
+      cuda_cpx_fetch_gradient ( n_in_batch , grad ) ;
+
+      n_done += n_in_batch ;
+      istart = istop ;
+      }  // For all batches
+
+   for (i=0 ; i<n_weights ; i++)
+      grad[i] /= nc * nout ;
+
+
+   if (classifier && (target != NULL)) {
+      cuda_cpx_ll ( nc , &mse ) ;
+      mse /= nout ;  // cuda_cpx_ll() divided by n but not nout
+      }
+
+   else
+      ret_val = cuda_cpx_mse ( nc * nout , &mse ) ;
+
+/*
+   Deal with weight penalty
+   First block of code does hidden layers, second does output layer
+*/
+
+   wpen = TrainParams.wpen / n_weights ;
+   penalty = 0.0 ;
+
+   nin_this_layer = nin ;
+
+   for (ilayer=0 ; ilayer<n_layers-1 ; ilayer++) {  // Do all hidden layers
+
+      for (ineuron=0 ; ineuron<nhid[ilayer] ; ineuron++) {
+         wptr =  weights[ilayer] + ineuron * mult * (nin_this_layer+1) ;  // Weights for this neuron in this layer
+         gptr = grad_ptr[ilayer] + ineuron * mult * (nin_this_layer+1) ;  // Ditto grad
+         for (ivar=0 ; ivar<mult*nin_this_layer ; ivar++) {               // Do not include bias
+            penalty += wptr[ivar] * wptr[ivar] ;
+            gptr[ivar] -= 2.0 * wpen * wptr[ivar] ;
+            }
+         }
+      nin_this_layer = nhid[ilayer] ;
+      }
+
+   for (ineuron=0 ; ineuron<nout ; ineuron++) {
+      wptr = last_layer_weights + ineuron * n_last_layer_weights ;
+      gptr = grad_ptr[n_layers-1] + ineuron * n_last_layer_weights ;
+      for (ivar=0 ; ivar<mult*nin_this_layer ; ivar++) {             // Do not include bias
+         penalty += wptr[ivar] * wptr[ivar] ;
+         gptr[ivar] -= 2.0 * wpen * wptr[ivar] ;
+         }
+      }
+
+   penalty *= wpen ;
+   return mse + penalty ;
+}

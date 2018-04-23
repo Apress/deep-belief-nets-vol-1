@@ -1,0 +1,265 @@
+/******************************************************************************/
+/*                                                                            */
+/*  MRFFT_P - This contains the 'permute' routine called from MRFFT.          */
+/*                                                                            */
+/******************************************************************************/
+
+void permute ( double *real , double *imag , int ntot , int npts ,
+               int nspan , int inc , int n_facs , int n_sq_facs , double *work1 ,
+               double *work2 , int *index , int *factors , int max_factor )
+{
+   int i, j, k, ibase, ip, span_inc, sqfac_index, fac_sum, offset, lfm1 ;
+   int inner_span, inner_span_m1, tot_pts, jmp, jump, jump_save, nearp, farp ;
+   int this_fac, other_fac, current_index, cycle, limit, which_index ;
+   double temp, *wptr1, *wptr2 ;
+
+   index[0] = inner_span = inc * nspan ;
+   inner_span_m1 = inner_span - 1 ;
+   tot_pts = inc * ntot ;
+   jump = inner_span / npts ;
+   current_index = 0 ;
+
+/*
+   Do the square factors
+*/
+
+   if (n_sq_facs) {
+      i = 0 ;
+      j = 2 * n_sq_facs ;
+      if (j >= n_facs)
+         --j ;
+      index[j+1] = jump ;
+      for (;;) {
+         index[i+1] = index[i] / factors[i] ;
+         index[j] = index[j+1] * factors[i] ;
+         if (++i >= --j)
+            break ;
+         }
+      nearp = jump ;
+      farp = span_inc = index[1] ;
+      jump_save = index[j+1] ;
+      which_index = 1 ;
+
+      if (npts != ntot) {
+mv_permute:
+         limit = nearp + jump ;  // Permutations for multivariate transform
+         while (nearp < limit) {
+            temp = real[nearp] ;
+            real[nearp] = real[farp] ;
+            real[farp] = temp ;
+            temp = imag[nearp] ;
+            imag[nearp] = imag[farp] ;
+            imag[farp] = temp ;
+            nearp += inc ;
+            farp += inc ;
+            }
+
+         k = inner_span - jump ;
+         nearp += k ;
+         farp += k ;
+         if (nearp >= tot_pts-1) {
+            nearp += jump - tot_pts ;
+            farp += span_inc - tot_pts ;
+            if (farp < inner_span_m1)
+               goto mv_permute ;
+            }
+         else
+            goto mv_permute ;
+
+         for (;;) {
+            ++which_index ;
+            farp += index[which_index] - index[which_index-2] ;
+            if (farp >= index[which_index-1])
+               continue ;
+            which_index = 1 ;
+            for (;;) {
+               if (nearp < farp)
+                  goto mv_permute ;
+               nearp += jump ;
+               farp += span_inc ;
+               if (farp >= inner_span_m1)
+                  break ;
+               }
+      
+            if (nearp >= inner_span_m1)
+               break ;
+            }
+         }
+
+/*
+   Permutation for single-value transform
+*/
+
+      else {
+permute_loop:
+         for (;;) {
+            temp = real[nearp] ;
+            real[nearp] = real[farp] ;
+            real[farp] = temp ;
+            temp = imag[nearp] ;
+            imag[nearp] = imag[farp] ;
+            imag[farp] = temp ;
+            nearp += inc ;
+            farp += span_inc ;
+            if (farp >= inner_span_m1)
+               break ;
+            }
+
+         for (;;) {
+            ++which_index ;
+            farp += index[which_index] - index[which_index-2] ;
+            if (farp >= index[which_index-1])
+               continue ;
+            which_index = 1 ;
+            for (;;) {
+               if (nearp >= farp) {
+                  nearp += inc ;
+                  farp += span_inc ;
+                  if (farp >= inner_span_m1)
+                     break ;
+                  }
+               else
+                  goto permute_loop ;
+               }
+            if (nearp >= inner_span_m1)
+               break ;
+            }
+         }
+
+      jump = jump_save ;
+      }
+
+/*
+   The square factors are done.  If that is all of them, we are done.
+*/
+
+   if (2*n_sq_facs+1 >= n_facs)
+      return ;
+
+/*
+   Permutations for square-free factors
+*/
+
+   sqfac_index = index[n_sq_facs] ;
+   k = n_facs - n_sq_facs ;
+   factors[k] = 1 ;
+   while (--k > n_sq_facs)
+      factors[k-1] *= factors[k] ;
+
+   other_fac = factors[n_sq_facs++] ;
+   lfm1 = other_fac - 1 ;
+   k = n_sq_facs ;
+   this_fac = factors[k] ;
+   fac_sum = 0 ;
+   
+   for (i=0 ; i<lfm1 ;) {
+      fac_sum += this_fac ;
+      if (fac_sum >= other_fac) {
+         fac_sum -= other_fac ;
+         other_fac = this_fac ;
+         this_fac = factors[++k] ;
+         continue ;
+         }
+      other_fac = factors[n_sq_facs-1] ;
+      k = n_sq_facs ;
+      this_fac = factors[k] ;
+      index[i++] = fac_sum ;
+      }
+
+/*
+   Determine permutation cycles > 1
+*/
+
+   which_index = 0 ;
+   for (;;) {
+      while (index[which_index] < 0)
+         ++which_index ;
+      cycle = index[which_index++] ;
+      if (cycle != which_index) {
+         for (;;) {
+            i = cycle - 1 ;
+            cycle = index[i] ;
+            index[i] = -cycle ;
+            if (cycle == which_index)
+               break ;
+            }
+         current_index = cycle ;
+         continue ;
+         }
+      index[which_index-1] = -which_index ;
+      if (which_index == lfm1)
+         break ;
+      }
+
+   max_factor *= inc ;
+
+/*
+   Reorder 
+*/
+
+   which_index = current_index ;
+   tot_pts -= sqfac_index ;
+
+   while (tot_pts >= 0) {
+      while (index[--which_index] < 0) ;
+      jmp = jump ;
+      offset = tot_pts - inc ;
+
+      for (;;) {
+         inner_span = jmp ;
+         if (inner_span > max_factor)
+            inner_span = max_factor ;
+         jmp -= inner_span ;
+         cycle = index[which_index] ;
+         ibase = offset + jump * cycle + jmp ;
+         ip = ibase + inner_span ;
+         wptr1 = work1 ;
+         wptr2 = work2 ;
+         for (;;) {
+            *wptr1++ = real[ip] ;
+            *wptr2++ = imag[ip] ;
+            ip -= inc ;
+            if (ip == ibase)
+               break ;
+            }
+         for (;;) {
+            ip = ibase + inner_span ;
+            k = jump * (cycle + index[cycle-1]) ;
+            wptr1 = real - k ;
+            wptr2 = imag - k ;
+            for (;;) {
+               real[ip] = wptr1[ip] ;
+               imag[ip] = wptr2[ip] ;
+               ip -= inc ;
+               if (ip == ibase)
+                  break ;
+               }
+            ibase -= k ;
+            cycle = -index[cycle-1] ;
+            if (cycle == which_index+1)
+               break ;
+            }
+         ip = ibase + inner_span ;
+         wptr1 = work1 ;
+         wptr2 = work2 ;
+         for (;;) {
+            real[ip] = *wptr1++ ;
+            imag[ip] = *wptr2++ ;
+            ip -= inc ;
+            if (ip == ibase)
+               break ;
+            }
+         if (! jmp)
+            break ;
+         }
+      if (which_index)
+         continue ;
+
+      which_index = current_index ;
+      tot_pts -= sqfac_index ;
+      if (tot_pts < 0)
+         break ;
+      }
+   return ;
+}
+

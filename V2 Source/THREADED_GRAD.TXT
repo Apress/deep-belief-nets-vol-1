@@ -1,0 +1,692 @@
+
+/*
+--------------------------------------------------------------------------------
+
+   Local routine to compute activation (real version with logistic response)
+
+--------------------------------------------------------------------------------
+*/
+
+
+static void activity (
+   double *input ,   // This neuron's input vector, ninputs long
+   double *coefs ,   // Weight vector, ninputs+1 long (bias is at end)
+   double *output ,  // Achieved activation of this neuron
+   int ninputs ,     // Number of inputs
+   int outlin        // Activation function is identity if nonzero, else logistic
+   )
+{
+   double sum ;
+
+   sum = dotprod ( ninputs , input , coefs ) ;
+   sum += coefs[ninputs] ;      // Bias term
+
+   if (outlin)
+      *output = sum ;
+    else
+      *output = 1.0 / (1.0 + exp(-sum)) ;
+}
+
+
+/*
+-----------------------------------------------------------------------
+
+   activity_cc() - Compute complex-valued activity of a neuron
+                   with complex inputs and hyperbolic tangent response
+
+-----------------------------------------------------------------------
+*/
+
+static void activity_cc (
+   double *input ,   // This neuron's input vector, 2 * ninputs long
+   double *coefs ,   // Weight vector, 2 * (ninputs+1) long (bias is at end)
+   double *output ,  // Achieved activation of this neuron (real, imag)
+   double *d_rr ,    // If non-null, returns partial of real activation wrt real input
+   double *d_ii ,    // Ditto, imag wrt imag
+   double *d_ri ,    // Ditto, real wrt imag, which equals imag wrt real
+   int ninputs ,     // Number of possibly complex inputs; actual is double this
+   int outlin        // Activation function is identity if nonzero, else tanh
+   )
+{
+   double rsum, isum, raw_length, squashed_length, ratio, deriv, len_sq, temp ;
+
+   dotprodc ( ninputs , input , coefs , &rsum , &isum ) ;
+   rsum += coefs[2*ninputs] ;      // Bias term
+   isum += coefs[2*ninputs+1] ;
+
+   if (outlin) {
+      *output = rsum ;
+      *(output+1) = isum ;
+      return ;
+      }
+
+   len_sq = rsum * rsum + isum * isum + 1.e-60 ;
+   raw_length = sqrt ( len_sq ) ;
+   squashed_length = tanh ( 1.5 * raw_length ) ;
+   ratio = squashed_length / raw_length ;
+
+   *output = rsum * ratio ;
+   *(output+1) = isum * ratio ;
+
+   if (d_rr == NULL)
+      return ;
+
+   deriv = 1.5 * (1.0 - squashed_length * squashed_length) ;
+   temp = (deriv - ratio) / len_sq ;
+
+   *d_rr = ratio + rsum * rsum * temp ;
+   *d_ii = ratio + isum * isum * temp ;
+   *d_ri = rsum * isum * temp ;
+}
+
+
+
+/*
+--------------------------------------------------------------------------------
+
+   trial_thr - Compute the output for a given input by evaluating network
+               It optionally also computes partial derivatives.
+               This is a strictly local version for threading.
+
+               When called for a complex net, nin and nout refer to complex
+               numbers, so they must be doubled to reflect actual counts,
+               and the output will always be complex.
+
+--------------------------------------------------------------------------------
+*/
+
+static void trial_thr (
+   double *input ,                 // Input vector nin long
+   int n_layers ,                  // Number of layers, including output, not including input
+   int nin ,                       // Number of possibly complex inputs to the model (actual is double this if complex)
+   double *outputs ,               // Output vector of the model
+   int nout ,                      // Number of possibly complex outputs (actual is double this if complex)
+   int *nhid ,                     // nhid[i] is the number of hidden neurons in hidden layer i
+   double *weights[] ,             // weights[i] points to the weight vector for hidden layer i
+   double *hid_act[] ,             // hid_act[i] points to the vector of activations of hidden layer i
+   double *hid_rr[] ,              // Partial of real activation wrt real input
+   double *hid_ii[] ,              // Ditto, imaginary
+   double *hid_ri[] ,              // Ditto, real wrt imaginary = imaginary wrt real
+   double *last_layer_weights ,    // Weights of final layer
+   int complex ,                   // Is this a complex network?
+   int classifier                  // If nonzero use SoftMax output; else use linear output
+   )
+{
+   int i, ilayer ;
+   double sum ;
+
+   for (ilayer=0 ; ilayer<n_layers ; ilayer++) {
+
+      if (ilayer == 0  &&  n_layers == 1) {        // Direct input to output?
+         for (i=0 ; i<nout ; i++) {
+            if (complex)
+               activity_cc ( input , last_layer_weights+i*2*(nin+1) , outputs+2*i ,
+                             NULL , NULL , NULL , nin , 1 ) ;
+            else
+               activity ( input , last_layer_weights+i*(nin+1) , outputs+i , nin , 1 ) ;
+            }
+         }
+
+      else if (ilayer == 0) {                   // First hidden layer?
+         for (i=0 ; i<nhid[ilayer] ; i++) {
+            if (complex) {
+               if (hid_rr != NULL)
+                  activity_cc ( input , weights[ilayer]+i*2*(nin+1) , hid_act[ilayer]+2*i ,
+                                hid_rr[ilayer]+i , hid_ii[ilayer]+i , hid_ri[ilayer]+i , nin , 0 ) ;
+               else
+                  activity_cc ( input , weights[ilayer]+i*2*(nin+1) , hid_act[ilayer]+2*i ,
+                                NULL , NULL , NULL , nin , 0 ) ;
+               }
+            else
+               activity ( input , weights[ilayer]+i*(nin+1) , hid_act[ilayer]+i , nin , 0 ) ;
+            }
+         }
+
+      else if (ilayer < n_layers-1) {              // Subsequent hidden layer?
+         for (i=0 ; i<nhid[ilayer] ; i++) {
+            if (complex) {
+               if (hid_rr != NULL)
+                  activity_cc ( hid_act[ilayer-1] , weights[ilayer]+i*2*(nhid[ilayer-1]+1) , hid_act[ilayer]+2*i ,
+                                hid_rr[ilayer]+i , hid_ii[ilayer]+i , hid_ri[ilayer]+i , nhid[ilayer-1] , 0 );
+               else
+                  activity_cc ( hid_act[ilayer-1] , weights[ilayer]+i*2*(nhid[ilayer-1]+1) , hid_act[ilayer]+2*i ,
+                                NULL , NULL , NULL , nhid[ilayer-1] , 0 );
+               }
+            else
+               activity ( hid_act[ilayer-1] , weights[ilayer]+i*(nhid[ilayer-1]+1) , hid_act[ilayer]+i , nhid[ilayer-1] , 0 );
+            }
+         }
+
+      else {                                    // Final layer
+         for (i=0 ; i<nout ; i++) {
+            if (complex)
+               activity_cc ( hid_act[ilayer-1] , last_layer_weights+i*2*(nhid[ilayer-1]+1) , outputs+2*i ,
+                             NULL , NULL , NULL , nhid[ilayer-1] , 1 );
+            else
+               activity ( hid_act[ilayer-1] , last_layer_weights+i*(nhid[ilayer-1]+1) , outputs+i , nhid[ilayer-1] , 1 );
+            }
+         }
+      }
+
+   if (classifier) {  // Classifier is always SoftMax
+      if (complex) {
+         sum = 0.0 ;
+         for (i=0 ; i<nout ; i++) {  // For all outputs
+            if (outputs[2*i] < 300.0)
+               outputs[2*i] = exp ( outputs[2*i] ) ;
+            else
+               outputs[2*i] = exp ( 300.0 ) ;
+            sum += outputs[2*i] ;
+            }
+         for (i=0 ; i<nout ; i++)
+            outputs[2*i] /= sum ;
+         }
+
+      else {         // Real domain
+         sum = 0.0 ;
+         for (i=0 ; i<nout ; i++) {  // For all outputs
+            if (outputs[i] < 300.0)
+               outputs[i] = exp ( outputs[i] ) ;
+            else
+               outputs[i] = exp ( 300.0 ) ;
+            sum += outputs[i] ;
+            }
+         for (i=0 ; i<nout ; i++)
+            outputs[i] /= sum ;
+         }
+      } // If classifier
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   batch_gradient - Cumulate the gradient for a given subset of inputs
+
+   Note: grad is all gradients as a vector, and grad_ptr[ilayer] points to
+         the entry in grad that is for the first weight in a layer
+
+--------------------------------------------------------------------------------
+*/
+
+
+static double batch_gradient (
+   int istart ,                    // Index of starting case in input matrix
+   int istop ,                     // And one past last case
+   double *input ,                 // Input matrix; each case is max_neurons long
+   double *targets ,               // Target matrix; strictly real, so each case is nout long
+   int *class_ids ,                // Class id vector if classifier (ignored if not)
+   int n_layers ,                  // Number of layers, including output, not including input
+   int n_weights ,                 // Total number of weights, including final layer and all bias terms
+   int nin ,                       // Number of possibly complex inputs to the model; Input matrix may have more columns (actual is double this if complex)
+   double *outputs ,               // Output vector of the model; used as work vector here
+   int nout ,                      // Number of possibly complex outputs (actual is double this if complex)
+   int *nhid ,                     // nhid[i] is the number of hidden neurons in hidden layer i
+   double *weights[] ,             // weights[i] points to the weight vector for hidden layer i
+   double *hid_act[] ,             // hid_act[i] points to the vector of activations of hidden layer i
+   double *hid_rr[] ,              // Partial of real activation wrt real input
+   double *hid_ii[] ,              // Ditto, imaginary
+   double *hid_ri[] ,              // Ditto, real wrt imaginary = imaginary wrt real
+   int max_neurons ,               // Number of columns in input matrix; may exceed nin; this is actual if complex
+   double *this_delta ,            // Delta for the current layer
+   double *prior_delta ,           // And saved for use in the prior (next to be processed) layer
+   double **grad_ptr ,             // grad_ptr[i] points to gradient for layer i
+   double *last_layer_weights ,    // Weights of final layer
+   double *grad ,                  // All computed gradients, strung out as a single long vector
+   int complex ,                   // Is this a complex network?
+   int classifier                  // If nonzero use SoftMax output; else use linear output
+   )
+{
+   int i, j, icase, ilayer, nprev, nthis, nnext, mult, iclass ;
+   double diff, *dptr, error, *targ_ptr, *prevact, *gradptr ;
+   double rsum, isum, delta, rdelta, idelta, *nextcoefs, tval ;
+   double *rr_ptr, *ii_ptr, *ri_ptr ;
+
+   mult = complex  ?  2 : 1 ; // Numbers per neuron
+
+   for (i=0 ; i<n_weights ; i++)  // Zero gradient for summing
+      grad[i] = 0.0 ;             // All layers are strung together here
+
+   error = 0.0 ;  // Will cumulate total error here
+
+   for (icase=istart ; icase<istop ; icase++) {
+
+      dptr = input + icase * max_neurons ; // Point to this sample; max_neurons is actual number of numbers
+      trial_thr ( dptr , n_layers , nin , outputs ,  nout , nhid ,
+                  weights , hid_act , hid_rr , hid_ii , hid_ri , 
+                  last_layer_weights , complex , classifier ) ;
+
+
+      if (classifier) {               // SoftMax
+         iclass = class_ids[icase] ;
+         for (i=0 ; i<nout ; i++) {
+            tval = (i == iclass)  ?  1.0 : 0.0 ;
+            this_delta[mult*i] = tval - outputs[mult*i] ; // Neg deriv of cross entropy wrt input (logit) i
+            if (complex)
+               this_delta[2*i+1] = 0.0 ;
+            }
+         error -= log ( outputs[mult*iclass] + 1.e-30 ) ;
+         }
+
+      else if (targets != NULL) {              // Training final model
+         targ_ptr = targets + icase * nout ;   // Targets are strictly real
+         for (i=0 ; i<nout ; i++) {
+            diff = outputs[mult*i] - targ_ptr[i] ;   // Real part of prediction is compared to target
+            error += diff * diff ;
+            this_delta[mult*i] = -2.0 * diff ;       // Neg deriv of squared error wrt input to neuron i
+            if (complex)
+               this_delta[2*i+1] = 0.0 ;             // Target is real so ignore imaginary prediction
+            }
+         }
+
+      else {                                  // Training an autoencoder
+         targ_ptr = input + icase * max_neurons ; // Point to this sample
+         for (i=0 ; i<mult*nout ; i++) {
+            diff = outputs[i] - targ_ptr[i] ;
+            error += diff * diff ;
+            this_delta[i] = -2.0 * diff ; // Neg deriv of squared error wrt input to neuron i
+            }
+         }
+
+/*
+   Cumulate output gradient
+   If complex, actual is double nprev
+*/
+
+      if (n_layers == 1) {                        // No hidden layer
+         nprev = nin ;                            // Number of possibly complex inputs to the output layer
+         prevact = input + icase * max_neurons ;  // Point to this sample
+         }
+      else {
+         nprev = nhid[n_layers-2] ;               // n_layers-2 is the last hidden layer
+         prevact = hid_act[n_layers-2] ;          // Point to layer feeding the output layer
+         }
+      gradptr = grad_ptr[n_layers-1] ;            // Point to output gradient in grand gradient vector
+      for (i=0 ; i<nout ; i++) {                  // For all output neurons
+         if (complex) {
+            rdelta = this_delta[2*i] ;
+            idelta = this_delta[2*i+1] ;
+            for (j=0 ; j<nprev ; j++) {
+               *gradptr++ +=  rdelta * prevact[2*j]   + idelta * prevact[2*j+1] ;
+               *gradptr++ += -rdelta * prevact[2*j+1] + idelta * prevact[2*j] ;
+               }
+            *gradptr++ += rdelta ;                 // Bias activation is always 1
+            *gradptr++ += idelta ;
+            }
+         else {
+            delta = this_delta[i] ;               // Neg deriv of criterion wrt logit
+            for (j=0 ; j<nprev ; j++)
+               *gradptr++ += delta * prevact[j] ; // Cumulate for all training cases
+            *gradptr++ += delta ;                 // Bias activation is always 1
+            }
+         }
+
+      nnext = nout ;                       // Prepare for moving back one layer
+      nextcoefs = last_layer_weights ;
+
+/*
+   Cumulate hidden gradients
+*/
+
+      for (ilayer=n_layers-2 ; ilayer>=0 ; ilayer--) {   // For each hidden layer, working backwards
+         nthis = nhid[ilayer] ;        // Number of neurons in this hidden layer
+         gradptr = grad_ptr[ilayer] ;      // Point to gradient for this layer
+
+         if (complex) {
+            rr_ptr = hid_rr[ilayer] ;
+            ii_ptr = hid_ii[ilayer] ;
+            ri_ptr = hid_ri[ilayer] ;
+            }
+
+         for (i=0 ; i<nthis ; i++) {       // For each neuron in this layer
+
+            if (complex) {
+
+               rsum = isum = 0.0 ;
+               for (j=0 ; j<nnext ; j++) {
+                  rsum +=  this_delta[2*j]   * nextcoefs[j*2*(nthis+1)+2*i] +
+                           this_delta[2*j+1] * nextcoefs[j*2*(nthis+1)+2*i+1] ;
+                  isum += -this_delta[2*j]   * nextcoefs[j*2*(nthis+1)+2*i+1] +
+                           this_delta[2*j+1] * nextcoefs[j*2*(nthis+1)+2*i] ;
+                  }
+
+               rdelta = rsum * rr_ptr[i] + isum * ri_ptr[i] ;
+               idelta = rsum * ri_ptr[i] + isum * ii_ptr[i] ;
+               prior_delta[2*i]   = rdelta ;                    // Save it for the next layer back
+               prior_delta[2*i+1] = idelta ;
+
+               if (ilayer == 0) {                          // First hidden layer?
+                  prevact = input + icase * max_neurons ;  // Point to this sample
+                  for (j=0 ; j<nin ; j++) {
+                     *gradptr++ +=  rdelta * prevact[2*j]   + idelta * prevact[2*j+1] ;
+                     *gradptr++ += -rdelta * prevact[2*j+1] + idelta * prevact[2*j] ;
+                     }
+                  }
+               else {      // There is at least one more hidden layer prior to this one
+                  prevact = hid_act[ilayer-1] ;
+                  for (j=0 ; j<nhid[ilayer-1] ; j++) {
+                     *gradptr++ +=  rdelta * prevact[2*j]   + idelta * prevact[2*j+1] ;
+                     *gradptr++ += -rdelta * prevact[2*j+1] + idelta * prevact[2*j] ;
+                     }
+                  }
+               *gradptr++ += rdelta ;   // Bias activation is always 1
+               *gradptr++ += idelta ;
+               }    // Complex
+
+            else {  // Real
+               delta = 0.0 ;
+               for (j=0 ; j<nnext ; j++)
+                  delta += this_delta[j] * nextcoefs[j*(nthis+1)+i] ;
+               delta *= hid_act[ilayer][i] * (1.0 - hid_act[ilayer][i]) ;  // Derivative
+               prior_delta[i] = delta ;                    // Save it for the next layer back
+               if (ilayer == 0) {                          // First hidden layer?
+                  prevact = input + icase * max_neurons ;  // Point to this sample
+                  for (j=0 ; j<nin ; j++)
+                     *gradptr++ += delta * prevact[j] ;
+                  }
+               else {      // There is at least one more hidden layer prior to this one
+                  prevact = hid_act[ilayer-1] ;
+                  for (j=0 ; j<nhid[ilayer-1] ; j++)
+                     *gradptr++ += delta * prevact[j] ;
+                  }
+               *gradptr++ += delta ;   // Bias activation is always 1
+               }
+
+            }  // For all neurons in this hidden layer
+
+         for (i=0 ; i<mult*nthis ; i++)        // These will be delta for the next layer back
+            this_delta[i] = prior_delta[i] ;
+
+         nnext = nhid[ilayer] ;                // Prepare for the next layer back
+         nextcoefs = weights[ilayer] ;
+         }  // For all layers, working backwards
+
+      } // for all cases
+
+   return error ;  // MSE or negative log likelihood
+}
+
+
+
+typedef struct {
+   int istart ;
+   int istop ;
+   int complex ;
+   int classifier ;
+   int n_layers ;
+   int n_weights ;
+   int nin ;
+   int nout ;
+   int *nhid ;
+   int max_neurons ;
+   double *input ;
+   double *targets ;
+   int *class_ids ;
+   double *outputs ;
+   double **weights ;
+   double **hid_act ;
+   double **hid_rr ;
+   double **hid_ii ;
+   double **hid_ri ;
+   double *this_delta ;
+   double *prior_delta ;
+   double **grad_ptr ;
+   double *last_layer_weights ;
+   double *grad ;
+   double error ;
+} GRAD_THR_PARAMS ;
+
+static unsigned int __stdcall batch_gradient_wrapper ( LPVOID dp )
+{
+((GRAD_THR_PARAMS *) dp)->error = batch_gradient (
+                          ((GRAD_THR_PARAMS *) dp)->istart ,
+                          ((GRAD_THR_PARAMS *) dp)->istop ,
+                          ((GRAD_THR_PARAMS *) dp)->input ,
+                          ((GRAD_THR_PARAMS *) dp)->targets ,
+                          ((GRAD_THR_PARAMS *) dp)->class_ids ,
+                          ((GRAD_THR_PARAMS *) dp)->n_layers ,
+                          ((GRAD_THR_PARAMS *) dp)->n_weights ,
+                          ((GRAD_THR_PARAMS *) dp)->nin ,
+                          ((GRAD_THR_PARAMS *) dp)->outputs ,
+                          ((GRAD_THR_PARAMS *) dp)->nout ,
+                          ((GRAD_THR_PARAMS *) dp)->nhid ,
+                          ((GRAD_THR_PARAMS *) dp)->weights ,
+                          ((GRAD_THR_PARAMS *) dp)->hid_act ,
+                          ((GRAD_THR_PARAMS *) dp)->hid_rr ,
+                          ((GRAD_THR_PARAMS *) dp)->hid_ii ,
+                          ((GRAD_THR_PARAMS *) dp)->hid_ri ,
+                          ((GRAD_THR_PARAMS *) dp)->max_neurons ,
+                          ((GRAD_THR_PARAMS *) dp)->this_delta ,
+                          ((GRAD_THR_PARAMS *) dp)->prior_delta ,
+                          ((GRAD_THR_PARAMS *) dp)->grad_ptr ,
+                          ((GRAD_THR_PARAMS *) dp)->last_layer_weights ,
+                          ((GRAD_THR_PARAMS *) dp)->grad ,
+                          ((GRAD_THR_PARAMS *) dp)->complex ,
+                          ((GRAD_THR_PARAMS *) dp)->classifier ) ;
+   return 0 ;
+}
+
+/*
+--------------------------------------------------------------------------------
+
+   gradient_thr() - Gradient for entire model
+
+--------------------------------------------------------------------------------
+*/
+
+double CpxAuto::gradient_thr (
+   int nc ,             // Number of cases
+   int nin ,            // Number of possibly complex inputs
+   double *input ,      // Nc by max_neurons input matrix
+   int nout ,           // Number of possibly complex outputs
+   double *target ,     // Nc by nout target matrix, or autoencoding if NULL
+   int n_layers ,       // Number of layers
+   int *nhid ,          // Number of hidden neurons in each layer
+   int n_weights ,      // Total (actual) number of weights, including final layers and bias
+   double *weights[] ,  // Weight matrices for layers
+   int use_final_layer_weights , // Use final_layer_weights (vs last weight layer)?
+   double *grad         // Concatenated gradient vector, which is computed here
+   )
+{
+   int i, j, ilayer, ineuron, ivar, n, istart, istop, n_done, ithread, mult ;
+   int n_in_batch, n_threads, ret_val, nin_this_layer, n_last_layer_weights ;
+   double error, *wptr, *gptr, factor, *hid_act_ptr[MAX_THREADS][MAX_LAYERS], *grad_ptr_ptr[MAX_THREADS][MAX_LAYERS] ;
+   double *hid_rr_ptr[MAX_THREADS][MAX_LAYERS], *hid_ii_ptr[MAX_THREADS][MAX_LAYERS], *hid_ri_ptr[MAX_THREADS][MAX_LAYERS] ;
+   double wpen, *last_layer_weights ;
+   char msg[256] ;
+   GRAD_THR_PARAMS params[MAX_THREADS] ;
+   HANDLE threads[MAX_THREADS] ;
+
+   mult = is_complex  ?  2 : 1 ;
+
+   if (use_final_layer_weights) {                      // Full CpxAuto model
+      last_layer_weights = final_layer_weights ;
+      n_last_layer_weights = n_final_layer_weights ;   // Per output, not total; If complex, this is actual
+      }
+
+   else {                                              // Greedily training a single layer
+      last_layer_weights = weights[n_layers-1] ;
+      n_last_layer_weights = mult * (nhid[n_layers-2] + 1) ;
+      }
+
+   wpen = TrainParams.wpen / n_weights ;
+
+/*
+   Compute length of grad vector and gradient positions in it.
+*/
+
+   gptr = grad ;  // CONJGRAD.CPP allocated this n_weights * max_threads long
+
+   for (ilayer=0 ; ilayer<n_layers ; ilayer++) {
+      grad_ptr[ilayer] = gptr ;
+
+      if (ilayer == 0  &&  n_layers == 1) {          // Direct input to output?
+         n = nout * mult * (nin+1) ;                 // This many inputs to each neuron in this layer
+         gptr += n ;                                 // Not needed, but it illustrates the process
+         }
+
+      else if (ilayer == 0) {                        // First hidden layer?
+         n = nhid[ilayer] * mult * (nin+1) ;         // This many inputs to each neuron in this layer
+         gptr += n ;
+         }
+
+      else if (ilayer < n_layers-1) {                   // Subsequent hidden layer?
+         n = nhid[ilayer] * mult * (nhid[ilayer-1]+1) ; // This many inputs to each neuron in this layer
+         gptr += n ;
+         }
+
+      else
+         n = nout * mult * (nhid[ilayer-1]+1) ;         // This many inputs to each neuron in this layer
+      } // For all layers, including output
+
+
+
+   for (i=0 ; i<max_threads ; i++) {
+      params[i].input = input ;
+      params[i].targets = target ;          // Will be NULL for autoencoding
+      params[i].class_ids = class_ids ;
+      params[i].n_layers = n_layers ;
+      params[i].n_weights = n_weights ;
+      params[i].nin = nin ;                 // If complex, double for actual
+      params[i].nout = nout ;               // Ditto
+      params[i].nhid = nhid ;
+      params[i].max_neurons = max_neurons ; // Already sized for complex
+      params[i].weights = weights ;
+      params[i].last_layer_weights = last_layer_weights ;
+
+      // Outputs is used strictly for scratch in each thread, not for saving predictions
+      if (use_final_layer_weights)
+         params[i].outputs = outputs + i * mult * nout ;
+      else
+         params[i].outputs = autoencode_out + i * mult * nin ;  // Autoencoding layer
+
+      params[i].this_delta = this_layer + i * max_neurons ;
+      params[i].prior_delta = prior_layer + i * max_neurons ;
+      params[i].grad = grad + i * n_weights ;
+      for (j=0 ; j<n_layers ; j++) {
+         hid_act_ptr[i][j] = hid_act[j] + i * max_neurons ;
+         grad_ptr_ptr[i][j] = grad_ptr[j] + i * n_weights ;
+         if (is_complex) {
+            hid_rr_ptr[i][j] = hid_rr[j] + i * max_neurons / 2 ;  // These are real
+            hid_ii_ptr[i][j] = hid_ii[j] + i * max_neurons / 2 ;
+            hid_ri_ptr[i][j] = hid_ri[j] + i * max_neurons / 2 ;
+            }
+         }
+      params[i].hid_act = hid_act_ptr[i] ;
+      params[i].grad_ptr = grad_ptr_ptr[i] ;
+      if (is_complex) {
+         params[i].hid_rr = hid_rr_ptr[i] ;
+         params[i].hid_ii = hid_ii_ptr[i] ;
+         params[i].hid_ri = hid_ri_ptr[i] ;
+         }
+      else
+         params[i].hid_rr = params[i].hid_ii = params[i].hid_ri = NULL ;
+
+      params[i].complex = is_complex ;
+
+      if (target == NULL)            // Autoencoding
+         params[i].classifier = 0 ;
+      else
+         params[i].classifier = classifier ;
+      }
+
+/*
+------------------------------------------------------------------------------------------------
+
+   Batch loop uses a different thread for each batch
+
+------------------------------------------------------------------------------------------------
+*/
+
+   n_threads = max_threads ;    // Try to use as many as possible
+   if (nc / n_threads < 100)    // But because threads have overhead
+      n_threads = 1 ;           // Avoid using them if the batch is small
+
+   istart = 0 ;         // Batch start = training data start
+   n_done = 0 ;         // Number of training cases done in this epoch so far
+
+   for (ithread=0 ; ithread<n_threads ; ithread++) {
+      n_in_batch = (nc - n_done) / (n_threads - ithread) ;  // Cases left to do / batches left to do
+      istop = istart + n_in_batch ;                         // Stop just before this index
+
+      // Set the pointers that vary with the batch
+
+      params[ithread].istart = istart ;
+      params[ithread].istop = istop ;
+
+      threads[ithread] = (HANDLE) _beginthreadex ( NULL , 0 , batch_gradient_wrapper , &params[ithread] , 0 , NULL ) ;
+      if (threads[ithread] == NULL) {
+         for (i=0 ; i<n_threads ; i++) {
+            if (threads[i] != NULL)
+               CloseHandle ( threads[i] ) ;
+            }
+         return -1.e40 ;
+         }
+
+      n_done += n_in_batch ;
+      istart = istop ;
+      } // For all threads / batches
+
+/*
+   Wait for threads to finish, and then cumulate all results into [0]
+*/
+
+   ret_val = WaitForMultipleObjects ( n_threads , threads , TRUE , 1200000 ) ;
+   if (ret_val == WAIT_TIMEOUT  ||  ret_val == WAIT_FAILED  ||  ret_val < 0  ||  ret_val >= n_threads)
+      return -1.e40 ;
+
+   CloseHandle ( threads[0] ) ;
+   for (ithread=1 ; ithread<n_threads ; ithread++) {
+      params[0].error += params[ithread].error ;
+      for (i=0 ; i<n_weights ; i++)
+         params[0].grad[i] += params[ithread].grad[i] ;
+      CloseHandle ( threads[ithread] ) ;
+      }
+
+
+/*
+   Find the mean per presentation.  Also, compensate for nout if that was
+   not done implicitly in the error computation.
+*/
+
+   factor = 1.0 / (nc * mult * nout) ;
+
+   error = factor * params[0].error ;
+
+   for (i=0 ; i<n_weights ; i++)
+      grad[i] = factor * params[0].grad[i] ;   // Note that grad and params[0].grad are the same!
+
+
+/*
+   Deal with weight penalty
+   First block of code does hidden layers, second does output layer
+*/
+
+   penalty = 0.0 ;
+
+   nin_this_layer = nin ;
+   for (ilayer=0 ; ilayer<n_layers-1 ; ilayer++) {  // Do all hidden layers
+
+      for (ineuron=0 ; ineuron<nhid[ilayer] ; ineuron++) {
+         wptr =  weights[ilayer] + ineuron * mult * (nin_this_layer+1) ;  // Weights for this neuron in this layer
+         gptr = grad_ptr[ilayer] + ineuron * mult * (nin_this_layer+1) ;  // Ditto grad
+         for (ivar=0 ; ivar<mult*nin_this_layer ; ivar++) {               // Do not include bias
+            penalty += wptr[ivar] * wptr[ivar] ;
+            gptr[ivar] -= 2.0 * wpen * wptr[ivar] ;
+            }
+         }
+      nin_this_layer = nhid[ilayer] ;
+      }
+
+   for (ineuron=0 ; ineuron<nout ; ineuron++) {
+      wptr = last_layer_weights + ineuron * n_last_layer_weights ;
+      gptr = grad_ptr[n_layers-1] + ineuron * n_last_layer_weights ;
+      for (ivar=0 ; ivar<mult*nin_this_layer ; ivar++) {             // Do not include bias
+         penalty += wptr[ivar] * wptr[ivar] ;
+         gptr[ivar] -= 2.0 * wpen * wptr[ivar] ;
+         }
+      }
+
+   penalty *= wpen ;
+   return error + penalty ;
+}

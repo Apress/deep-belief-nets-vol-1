@@ -1,0 +1,366 @@
+/******************************************************************************/
+/*                                                                            */
+/* MRFFT - This is the constructor, destructor, and external entry points     */
+/*         for the FFT class, which implements a mixed-radix Fast Fourier     */
+/*         Transform.  Two large subroutines are called from here.            */
+/*         MRFFT_K contains 'kernels' which transforms for all prime kernels. */
+/*         MRFFT_P contains 'permute' which does the final permutations.      */
+/*                                                                            */
+/* When the user constructs an FFT object, working storage is allocated.      */
+/* If there is a problem, the public member variable 'ok' is set to zero.     */
+/* Normally it is set to one.                                                 */
+/*                                                                            */
+/* The constructor call supplies all of the dimensions of the transform.      */
+/* The member functions that perform the transform are:                       */
+/*                                                                            */
+/*   cpx ( double *real , double *imag , int isign ) - Compute the fully      */
+/*         general multivariate complex Fourier transform.                    */
+/*                                                                            */
+/*   rv ( double *real , double *imag ) - Compute the forward transform       */
+/*        (isign=1) of a real vector containing an even number of points.     */
+/*                                                                            */
+/*   irv ( double *real , double *imag ) - Compute the inverse transform      */
+/*         (isign=-1) of the transform of a real vector.                      */
+/*                                                                            */
+/*                                                                            */
+/* This algorithm is heavily inspired by Singleton's famous FORTRAN version.  */
+/* The following changes have been made relative to the version of the        */
+/* program on which this is based:                                            */
+/*   1) There was a severe bug in the method for computing the maximum amount */
+/*      of working storage required.  Some values of N cause it to be         */
+/*      underestimated.  This has been fixed.                                 */
+/*   2) Like most efficient implementations, that version uses a trig         */
+/*      identity to compute successive angle functions across spans.          */
+/*      However, he reverts to direct sine and cosine computation every       */
+/*      32 passes to avoid buildup of error.  Unfortunately, the logic for    */
+/*      doing that contains a flaw that results in an endless loop for a      */
+/*      a few rare values of N.  (The first appears to be 2*2*3*3*11*11.)     */
+/*      Modern math coprocessors work at an internal precision that exceeds   */
+/*      external precision.  Thus, error does not build up as much as it did  */
+/*      in early mainframes.  The recomputation logic has been removed from   */
+/*      the version here.                                                     */
+/*   3) Modern processors rely heavily on pipelines.  Therefore, great        */
+/*      effort was expended to reorder all loops so as to avoid breaking      */
+/*      pipelines and to take advantage of branch prediction as much as       */
+/*      possible.  Sometimes that has required repetition of some code.       */
+/*      So be it.  It is worthwhile.                                          */
+/*   4) The order of many floating-point operations has been revised to       */
+/*      keep repeatedly used operands physically close in the code.           */
+/*      This helps optimizing compilers, as well as facilitating use of       */
+/*      the fpt stack in assembler versions.                                  */
+/*   5) Many subscript operations have been changed to pointer references.    */
+/*      Those that are kept as subscripts (mainly in the permutation code     */
+/*      because the subscripts are intimately related to the algorithm)       */
+/*      have been revised to reflect the 0-origin of C as opposed to the      */
+/*      1-origin of FORTRAN.  This occasionally made it necessary to make     */
+/*      significant changes to the algorithm relative to Singleton's version. */
+/*                                                                            */
+/******************************************************************************/
+
+
+void kernels ( double *real , double *imag , int ntot , int npts , int nspan ,
+               int isign , int n_facs , double *rwork , double *iwork ,
+               double *cosines , double *sines , int *factors ) ;
+
+void permute ( double *real , double *imag , int ntot , int npts ,
+               int nspan , int inc , int n_facs , int n_sq_facs , double *work1 ,
+               double *work2 , int *index , int *factors , int max_factor ) ;
+
+/*
+--------------------------------------------------------------------------------
+
+   Constructor
+
+   If there is insufficient memory, it leaves public ok=0.
+   The user should check for this after allocating with new.
+
+--------------------------------------------------------------------------------
+*/
+
+FFT::FFT (
+   int ndim ,       // Dimension of current variable, N for a vector
+   int spacing ,    // Spacing of consecutive points, 1 for a vector
+   int n_segments   // Number of ndim*spacing segments, 1 for a vector
+   )
+{
+   int i, kernel, trial, trial_sq, max_permute ;
+
+   rwork = NULL ;
+   iwork = NULL ;
+   ok = 1 ;  // In case early return due to parameters
+
+   npts = ndim ;
+   if (npts == 1)  // FFT of a single point is itself
+      return ;
+
+   nspan = ndim * spacing ;
+   ntot = nspan * n_segments ;
+
+   if (ntot == 0)
+      return ;  // error if any of these are zero
+
+/*
+   Determine the factors of n
+*/
+
+   max_permute = 1 ; // Added 5/97 per LINT (Not a bug)
+   kernel = ndim ;   // Successively divide this as it is factored
+   n_facs = 0 ;      // Number of factors so far
+
+   while (kernel % 16 == 0) {   // Factors of 4*4
+      all_factors[n_facs++] = 4 ;
+      kernel /= 16 ;
+      }
+
+   trial = 3 ;
+   trial_sq = 9 ;
+
+   while (trial_sq <= kernel) {     // Factors of 3*3, 5*5, 7*7, etc.
+      while (kernel % trial_sq == 0) {
+         all_factors[n_facs++] = trial ;
+         kernel /= trial_sq ;
+         }
+      trial += 2 ;
+      trial_sq = trial * trial ;
+      }
+
+   if (kernel <= 4) {               // Is just this one last factor left?
+      n_sq_facs = n_facs ;
+      if (kernel != 1)
+         all_factors[n_facs++] = kernel ;
+      }
+
+   else {                           // More factors remain
+      if (kernel % 4 == 0) {        // Factor of 2*2
+         all_factors[n_facs++] = 2 ;
+         kernel /= 4 ;
+         }
+
+/*
+   All square factors are out.  Now do the rest.
+*/
+
+      n_sq_facs = n_facs ;          // Preserve number of square factors
+
+      max_permute = n_sq_facs + n_sq_facs + 2 ;  // Length of work area
+      if (kernel-1 > max_permute)
+         max_permute = kernel-1 ;
+
+      trial = 2 ;
+      while (trial <= kernel) {      // trial=2, 3, 5, 7, 9, ...
+         if (kernel % trial == 0) {
+            all_factors[n_facs++] = trial ;
+            kernel /= trial ;
+            }
+         trial = (trial == 2)  ?  3  :  trial+2 ;
+         }
+      }
+
+   if (n_facs <= n_sq_facs+1)          // Length of work area
+      max_permute = n_facs + n_sq_facs + 1 ;
+
+/*
+   The factoring is done.
+   The square factors are up front, followed by the rest.
+   Copy the square factors to the end in reverse order.
+*/
+
+   i = n_sq_facs ;
+   while (i)
+      all_factors[n_facs++] = all_factors[--i] ;
+
+/*
+   We will need working storage of length equal to the largest factor.
+   Find that value.
+*/
+
+   max_factor = 0 ;
+   for (i=0 ; i<n_facs ; i++) {
+      if (all_factors[i] > max_factor)
+         max_factor = all_factors[i] ;
+      }
+
+/*
+   Allocate work areas
+*/
+
+   rwork = (double *) malloc ( 4 * max_factor * sizeof(double) ) ;
+   iwork = (int *) malloc ( max_permute * sizeof(int) ) ;
+   if ((rwork == NULL)  ||  (iwork == NULL)) {
+      if (rwork != NULL)
+         free ( rwork ) ;
+      if (iwork != NULL)
+         free ( iwork ) ;
+      rwork = NULL ;
+      iwork = NULL ;
+      ok = 0 ;
+      return ;
+      }
+}
+
+/*
+--------------------------------------------------------------------------------
+
+   Destructor
+
+--------------------------------------------------------------------------------
+*/
+
+FFT::~FFT ()
+{
+   if (! ok)
+      return ;
+   if (rwork != NULL)
+      free ( rwork ) ;
+   if (iwork != NULL)
+      free ( iwork ) ;
+}
+
+/*
+--------------------------------------------------------------------------------
+
+   Compute a full complex multivariate transform
+
+--------------------------------------------------------------------------------
+*/
+
+void FFT::cpx ( double *real , double *imag , int isign ) // Complex array
+{
+   int i, factors[64] ;
+
+   if (npts == 1)
+      return ;
+
+   for (i=0 ; i<n_facs ; i++)
+      factors[i] = all_factors[i] ;
+
+   kernels ( real , imag , ntot , npts , nspan , isign , n_facs ,
+             rwork , rwork+max_factor , rwork+2*max_factor ,
+             rwork+3*max_factor , factors ) ;
+
+   permute ( real , imag , ntot , npts , nspan , abs(isign) , n_facs ,
+             n_sq_facs , rwork , rwork+max_factor , iwork , factors ,
+             max_factor ) ;
+}
+
+/*
+--------------------------------------------------------------------------------
+
+   Compute a forward transform (positive sign) of a real vector 2*N long
+   alternately arranged in the real and imaginary inputs.
+
+   The constructor must have been called with ndim equal to half the length
+   of the real series.
+
+   Note that the real part of the Nyquist point is returned in imag[0],
+   which is truly zero.
+
+--------------------------------------------------------------------------------
+*/
+
+void FFT::rv (
+   double *real ,  // In: 0,2,4,... Out:Real parts
+   double *imag    // In: 1,3,5,... Out: Imaginary parts
+   )
+{
+   int i, j, lim ;
+   double theta, wr, wi, wkr, wki, t, h1r, h1i, h2r, h2i ;
+
+   cpx ( real , imag , 1 ) ;
+
+/*
+   Use the guaranteed zero imag[0] to actually return real[n]
+*/
+
+   t = real[0] ;
+   real[0] = t + imag[0] ;
+   imag[0] = t - imag[0] ;
+
+/*
+   Now do the remainder through n-1
+*/
+
+   theta = PI / (double) npts ;
+   t = sin ( 0.5 * theta ) ;
+   wr = 1.0 + (wkr = -2.0 * t * t) ;
+   wi = wki = sin ( theta ) ;
+
+   lim = (npts % 2)  ?  npts/2+1 : npts/2 ;
+   for (i=1 ; i<lim ; i++) {
+      j = npts - i ;
+      h1r =  0.5 * (real[i] + real[j]) ;
+      h1i =  0.5 * (imag[i] - imag[j]) ;
+      h2r =  0.5 * (imag[i] + imag[j]) ;
+      h2i = -0.5 * (real[i] - real[j]) ;
+      real[i] =  wr * h2r  -  wi * h2i  +  h1r ;
+      imag[i] =  wr * h2i  +  wi * h2r  +  h1i ;
+      real[j] = -wr * h2r  +  wi * h2i  +  h1r ;
+      imag[j] =  wr * h2i  +  wi * h2r  -  h1i ;
+      t = wr ;
+      wr += t * wkr  -  wi * wki ;
+      wi += t * wki  +  wi * wkr ;
+      }
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Compute an inverse transform (negative sign) of an N+1 complex vector
+   in the real and imaginary inputs.  This routine assumes that this vector
+   is the Fourier transform of a real vector.  Thus, it is symmetric and
+   the imaginary part of its first and Nyquist terms are zero.  Therefore,
+   the user must place real[N] in imag[0] before calling this routine.
+   The transform is done in place using only N elements of each vector.
+   The output series is returned alternating in real[i] and imag[i], and
+   divided by N.
+   In other words, this routine exactly reverses the operation of rv.
+
+   The constructor must have been called with ndim equal to half the length
+   of the real output series.
+
+--------------------------------------------------------------------------------
+*/
+
+void FFT::irv (
+   double *real ,  // In: Real parts         Out: 0,2,4,...
+   double *imag    // In: Imaginary parts    Out: 1,3,5,...
+   )
+{
+   int i, j, lim ;
+   double theta, wr, wi, wkr, wki, t, h1r, h1i, h2r, h2i ;
+
+   theta = -PI / (double) npts ;
+   t = sin ( 0.5 * theta ) ;
+   wr = 1.0 + (wkr = -2.0 * t * t) ;
+   wi = wki = sin ( theta ) ;
+
+   lim = (npts % 2)  ?  npts/2+1 : npts/2 ;
+   for (i=1 ; i<lim ; i++) {
+      j = npts - i ;
+      h1r =  0.5 * (real[i] + real[j]) ;
+      h1i =  0.5 * (imag[i] - imag[j]) ;
+      h2r = -0.5 * (imag[i] + imag[j]) ;
+      h2i =  0.5 * (real[i] - real[j]) ;
+      real[i] =  wr * h2r  -  wi * h2i  +  h1r ;
+      imag[i] =  wr * h2i  +  wi * h2r  +  h1i ;
+      real[j] = -wr * h2r  +  wi * h2i  +  h1r ;
+      imag[j] =  wr * h2i  +  wi * h2r  -  h1i ;
+      t = wr ;
+      wr += t * wkr  -  wi * wki ;
+      wi += t * wki  +  wi * wkr ;
+      }
+
+   t = real[0] ;
+   real[0] = 0.5 * (t + imag[0]) ;
+   imag[0] = 0.5 * (t - imag[0]) ;
+
+   cpx ( real , imag , -1 ) ;
+
+   t = 1.0 / npts ;
+   for (i=0 ; i<npts ; i++) {
+      real[i] *= t ;
+      imag[i] *= t ;
+      }
+}
+

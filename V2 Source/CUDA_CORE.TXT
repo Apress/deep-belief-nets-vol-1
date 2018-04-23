@@ -1,0 +1,1906 @@
+// About 128-byte memory alignment...
+// We do it only for hidden and output weight matrices.
+
+// This is used as intermediary between device's float and hosts double
+
+static float *fdata = NULL ;
+
+
+static int n_out_weights ;  // Total number of output weights (includes end-of-row padding)
+static int n_hid_weights ;  // Total number of hidden weights across all layers (includes end-of-row padding)
+
+
+// This is strictly for printing memory allocation info for the user
+
+static double total_memory = 0.0 ;
+
+
+// These are for the reductions used in device_cpx_mse
+// The number of threads MUST be a power of two!
+// The number of blocks given here is a maximum.  The actual number may be less.
+
+#define REDUC_THREADS 256
+#define REDUC_BLOCKS 64
+
+static float *reduc_fdata = NULL ;
+
+
+// These are set in cpx_cuda_init and used by the host routine that launches the kernel
+// They are basic app parameters, constant for all launches
+// Names that begin with d_ are in the device namespace.
+// Names that begin with h_ are in the host namespace and equal the device value.
+// This lets us save a little time by avoiding the need to pass a bunch of parameters in the launch.
+// We could, of course, just pass data pointers as parameters.  But that's overhead.
+// So instead we use cudaMemcpyToSymbol() to copy the values in the host namespace
+// to values on the device.  This lets __global routines address the values that are
+// already set on the device rather than having to use passed parameters.
+// The savings is probably small, but worthwhile.
+
+// In comments, "complex" means count of possibly complex values, "actual" is count of actual numbers,
+// which will be twice complex counts if a complex model.
+
+static int is_complex ;                    // Is this a complex model?
+static int mult ;                          // 2 if complex, else 1
+
+__constant__ int *d_is_classifier ;        // Is this a classifier?
+__constant__ int d_complex ;               // Is this a complex model?
+__constant__ int d_ncases ;                // Number of cases in complete training set
+__constant__ int d_n_trn_inputs ;          // Number of first-layer inputs (training data) (complex)
+__constant__ int d_ntarg ;                 // Number of targets (output neurons) (complex)
+__constant__ int d_ntarg_cols ;            // Ditto, extended to multiple of 128 bytes (32 floats) (actual)
+__constant__ int d_n_layers ;              // Number of layers
+__constant__ int d_mult ;                  // 1 if real model, 2 if complex
+__constant__ int d_autoencode ;            // If nonzero, include imaginary part of targets in error
+
+static       int *h_nhid = NULL ;          // Number of neurons in each of the hidden layers (complex)
+__constant__ int *d_nhid ;
+static       int *h_nhid_cols = NULL ;     // Ditto, extended to multiple of 128 bytes (32 floats) (actual)
+__constant__ int *d_nhid_cols ;
+
+static       float *h_trn_data = NULL ;    // Raw training data; ncases by mult*n_trn_inputs
+__constant__ float *d_trn_data ;
+
+static       float *h_targets = NULL ;     // Target data; ncases by ntarg (always strictly real, even if complex model)
+__constant__ float *d_targets ;
+
+static       int *h_class = NULL ;         // If classification (SoftMax), class id is here
+__constant__ int *d_class ;
+
+static       float *hidden_weights = NULL ;// Weight matricies for hidden layers, transpose of Host storage
+static       float **h_whid = NULL ;
+__constant__ float **d_whid ;
+
+static       float *h_wout = NULL ;        // Weight matrix for output layer, transpose of Host storage
+__constant__ float *d_wout ;
+
+static       double *activations = NULL ;  // Activations of this layer, which we compute
+static       double **h_act = NULL ;       // Array of pointers to each layer
+__constant__ double **d_act ;
+
+static       double *derivs = NULL ;       // Activation derivatives of this layer, which we compute
+static       double **h_drr = NULL ;       // Array of pointers to each layer for real/real
+__constant__ double **d_drr ;
+static       double **h_dii = NULL ;       // Array of pointers to each layer for imaginary/imaginary
+__constant__ double **d_dii ;
+static       double **h_dri = NULL ;       // Array of pointers to each layer for real/imaginary
+__constant__ double **d_dri ;
+
+static       double *h_output = NULL ;     // Output activations, complex if complex model
+__constant__ double *d_output ;
+
+static       float *h_mse_out = NULL ;     // For outputting performance measure
+__constant__ float *d_mse_out ;
+
+static       double *h_this_delta = NULL ; // Delta for current layer, complex if complex model
+__constant__ double *d_this_delta ;
+
+static       double *h_prior_delta = NULL ;// Delta for next layer back, complex if complex model
+__constant__ double *d_prior_delta ;
+
+// WARNING... If gradient is ever double instead of float, see CPX_CUDA.CPP for integer overflow check!
+static       int h_gradlen ;               // Length of complete gradient for a case (actual)
+__constant__ int d_gradlen ;
+static       float *h_gradient = NULL ;    // Gradient for all layers, including output
+__constant__ float *d_gradient ;           // Stored in same order as host, which is transpose of weights here
+static       float **h_grad_ptr = NULL ;   // Pointers to locations in gradient for each layer
+__constant__ float **d_grad_ptr ;
+
+static cudaDeviceProp deviceProp ;
+
+// Function declarations
+
+__global__ void device_cpx_hidden_activation_r ( int istart , int istop , int ilayer ) ;
+__global__ void device_cpx_hidden_activation_c ( int istart , int istop , int ilayer ) ;
+__global__ void device_cpx_hidden_activation_d ( int istart , int istop , int ilayer ) ;
+__global__ void device_cpx_output_activation_r ( int istart ) ;
+__global__ void device_cpx_output_activation_c ( int istart ) ;
+__global__ void device_cpx_output_delta ( int istart , int istop , int ntarg ) ;
+__global__ void device_cpx_softmax_delta ( int istart , int istop , int ntarg ) ;
+__global__ void device_cpx_output_gradient_r ( int nc , int ilayer ) ;
+__global__ void device_cpx_output_gradient_c ( int nc , int ilayer ) ;
+__global__ void device_cpx_first_hidden_gradient_r ( int istart , int istop , int only_hidden ) ;
+__global__ void device_cpx_first_hidden_gradient_c ( int istart , int istop , int only_hidden ) ;
+__global__ void device_cpx_subsequent_hidden_gradient_r ( int nc , int ilayer , int last_hidden ) ;
+__global__ void device_cpx_subsequent_hidden_gradient_c ( int nc , int ilayer , int last_hidden ) ;
+__global__ void device_cpx_move_delta ( int nhid ) ;
+__global__ void device_cpx_softmax ( int istart , int istop ) ;
+__global__ void device_cpx_fetch_gradient ( int nc ) ;
+__global__ void device_cpx_mse () ;
+__global__ void device_cpx_ll () ;
+
+
+/*
+--------------------------------------------------------------------------------
+
+   CPX_CUDA_INIT - Initialize for CUDA CPX processing
+
+   This is called once before training begins, and cpx_cuda_cleanup must
+   be called after training is complete.
+
+   Fdata is used here to translate data from double (on the host) to float (on the device).
+   It is freed here, immediately after use, in most routines, but then
+   permanently allocated as a last step.
+
+--------------------------------------------------------------------------------
+*/
+
+
+int cpx_cuda_init (
+   int complex ,          // Is this a complex-domain model?
+   int classifier ,       // Is this for classification? (SoftMax outputs)
+   int *class_ids ,       // Class ids if classifier
+   int ncases ,           // Number of training cases
+   int n_inputs ,         // Number of inputs (complex)
+   int ncols ,            // Number of columns in data matrix
+   double *data ,         // Input data, ncases rows by ncols columns, of which first n_inputs are used
+   int ntarg ,            // Number of targets (outputs; classes in classification) (complex)
+   double *targets ,      // Targets, ncases by ntarg; always real, even for complex models
+   int max_batch ,        // Max size of any batch
+   int n_layers ,         // Number of layers of neurons, including output
+   int *nhid ,            // Number of neurons in each hidden layer (complex)
+   char *error_msg        // Returns text of error if problem
+   )
+{
+   int i, j, k, n, n_total, n_max, n_prior, memsize, ntarg_cols, nhid_cols[MAX_LAYERS] ;
+   float *gptr, *fptr[MAX_LAYERS] ;
+   double *dptr[MAX_LAYERS] ;
+   char msg[256] ;
+   cudaError_t error_id ;
+
+   error_id = cudaSetDevice ( 0 ) ;
+
+   cudaGetDeviceProperties ( &deviceProp , 0 ) ;
+
+
+/*
+   Constants
+*/
+
+   is_complex = complex ;                         // Static with source scope
+   mult = complex  ?  2 : 1 ;                     // Ditto
+
+   ntarg_cols = mult * ((ntarg + 31) / 32 * 32) ; // For memory alignment of weights to 128 bytes
+                                                  // This applies to only output weights
+
+   cudaMemcpyToSymbol ( d_is_classifier , &classifier , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_complex , &complex , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_mult , &mult , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_ncases , &ncases , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_n_trn_inputs , &n_inputs , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_ntarg , &ntarg , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_ntarg_cols , &ntarg_cols , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   cudaMemcpyToSymbol ( d_n_layers , &n_layers , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+   k = (targets == NULL)  ?  1 : 0 ;
+   cudaMemcpyToSymbol ( d_autoencode , &k , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+
+
+/*
+   nhid - Array of number of neurons in each hidden layer (complex)
+          We also keep nhid_cols, which is the neurons counts bumped up to multiples of 32 (actual)
+          so as to keep rows of weight matrices starting on 128-byte boundaries.
+*/
+
+   memsize = (n_layers-1) * sizeof(int) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_nhid , (size_t) memsize ) ;
+   error_id = cudaMemcpy ( h_nhid , nhid , (n_layers-1) * sizeof(int) , cudaMemcpyHostToDevice ) ;
+   error_id = cudaMemcpyToSymbol ( d_nhid , &h_nhid , sizeof(int *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   for (i=0 ; i<n_layers-1 ; i++)
+      nhid_cols[i] = (mult * nhid[i] + 31) / 32 * 32 ;
+   memsize = (n_layers-1) * sizeof(int) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_nhid_cols , (size_t) memsize ) ;
+   error_id = cudaMemcpy ( h_nhid_cols , nhid_cols , (n_layers-1) * sizeof(int) , cudaMemcpyHostToDevice ) ;
+   error_id = cudaMemcpyToSymbol ( d_nhid_cols , &h_nhid_cols , sizeof(int *) , 0 , cudaMemcpyHostToDevice ) ;
+
+/*
+   Data - We must extract only the first mult * n_inputs columns from the ncols columns in data
+*/
+
+   fdata = (float *) MALLOC ( ncases * mult * n_inputs * sizeof(float) ) ;
+
+   memsize = ncases * mult * n_inputs * sizeof(float) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_trn_data , (size_t) memsize ) ;
+
+   for (i=0 ; i<ncases ; i++) {
+      for (j=0 ; j<mult*n_inputs ; j++)
+         fdata[i*mult*n_inputs+j] = (float) data[i*ncols+j] ;
+      }
+
+   error_id = cudaMemcpy ( h_trn_data , fdata , ncases * mult * n_inputs * sizeof(float) , cudaMemcpyHostToDevice ) ;
+   FREE ( fdata ) ;
+   fdata = NULL ;
+
+   error_id = cudaMemcpyToSymbol ( d_trn_data , &h_trn_data , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+
+/*
+   Targets (Always real, even for complex models)
+*/
+
+   if (targets != NULL) {   // Training full model (vs autoencoding)
+      fdata = (float *) MALLOC ( ncases * ntarg * sizeof(float) ) ;
+
+      memsize = ncases * ntarg * sizeof(float) ;
+      total_memory += memsize ;
+      error_id = cudaMalloc ( (void **) &h_targets , (size_t) memsize ) ;
+
+      for (i=0 ; i<ncases ; i++) {
+         for (j=0 ; j<ntarg ; j++)
+            fdata[i*ntarg+j] = (float) targets[i*ntarg+j] ;
+         }
+      error_id = cudaMemcpy ( h_targets , fdata , ncases * ntarg * sizeof(float) , cudaMemcpyHostToDevice ) ;
+
+      FREE ( fdata ) ;
+      fdata = NULL ;
+
+      error_id = cudaMemcpyToSymbol ( d_targets , &h_targets , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+      }
+
+   else {  // Autoencoding
+      assert ( ntarg == n_inputs ) ;
+      error_id = cudaMemcpyToSymbol ( d_targets , &h_trn_data , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+      }
+
+
+/*
+   Classes if this is a classifier
+*/
+
+   if (classifier) {
+      memsize = ncases * sizeof(int) ;
+      total_memory += memsize ;
+      error_id = cudaMalloc ( (void **) &h_class , (size_t) memsize ) ;
+      error_id = cudaMemcpy ( h_class , class_ids , ncases * sizeof(int) , cudaMemcpyHostToDevice ) ;
+      error_id = cudaMemcpyToSymbol ( d_class , &h_class , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+      }
+
+/*
+   Activations
+*/
+
+   n_total = 0 ;
+   for (i=0 ; i<n_layers-1 ; i++)
+      n_total += nhid[i] ;
+
+   memsize = mult * n_total * max_batch * sizeof(double) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &activations , (size_t) memsize ) ;
+
+   memsize = (n_layers-1) * sizeof(void *) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_act , (size_t) memsize ) ;
+   cudaMemcpyToSymbol ( d_act , &h_act , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   n_total = 0 ;
+   for (i=0 ; i<n_layers-1 ; i++) {
+      dptr[i] = activations + n_total * max_batch ;
+      n_total += mult * nhid[i] ;
+      }
+
+   error_id = cudaMemcpy ( h_act , &dptr[0] , (n_layers-1) * sizeof(void *) , cudaMemcpyHostToDevice ) ;
+
+/*
+   Derivatives of activation function are needed for a complex model
+*/
+
+   if (is_complex) {
+      n_total = 0 ;
+      for (i=0 ; i<n_layers-1 ; i++)
+         n_total += nhid[i] ;
+
+      memsize = 3 * n_total * max_batch * sizeof(double) ; // The three derivs are all real
+      total_memory += memsize ;
+      error_id = cudaMalloc ( (void **) &derivs , (size_t) memsize ) ;
+
+      memsize = (n_layers-1) * sizeof(void *) ;
+      total_memory += memsize ;
+      error_id = cudaMalloc ( (void **) &h_drr , (size_t) memsize ) ;
+      cudaMemcpyToSymbol ( d_drr , &h_drr , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+      total_memory += memsize ;
+      error_id = cudaMalloc ( (void **) &h_dii , (size_t) memsize ) ;
+      cudaMemcpyToSymbol ( d_dii , &h_dii , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+      total_memory += memsize ;
+      error_id = cudaMalloc ( (void **) &h_dri , (size_t) memsize ) ;
+      cudaMemcpyToSymbol ( d_dri , &h_dri , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+      n_total = 0 ;
+
+      for (i=0 ; i<n_layers-1 ; i++) {
+         dptr[i] = derivs + n_total * max_batch ;
+         n_total += nhid[i] ;
+         }
+
+      error_id = cudaMemcpy ( h_drr , &dptr[0] , (n_layers-1) * sizeof(void *) , cudaMemcpyHostToDevice ) ;
+
+      for (i=0 ; i<n_layers-1 ; i++) {
+         dptr[i] = derivs + n_total * max_batch ;
+         n_total += nhid[i] ;
+         }
+
+      error_id = cudaMemcpy ( h_dii , &dptr[0] , (n_layers-1) * sizeof(void *) , cudaMemcpyHostToDevice ) ;
+
+      for (i=0 ; i<n_layers-1 ; i++) {
+         dptr[i] = derivs + n_total * max_batch ;
+         n_total += nhid[i] ;
+         }
+
+      error_id = cudaMemcpy ( h_dri , &dptr[0] , (n_layers-1) * sizeof(void *) , cudaMemcpyHostToDevice ) ;
+      } // If is_complex (we need derivatives)
+
+
+/*
+   Output activations
+*/
+
+   memsize = ncases * mult * ntarg * sizeof(double) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_output , (size_t) memsize ) ;
+   error_id = cudaMemcpyToSymbol ( d_output , &h_output , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+
+/*
+   Hidden layer weights
+   These are stored as the transpose of those in Host,
+   with the neurons in the 'current' layer changing fastest.
+   Within each layer's weight matrix, rows (sets of current layer weights)
+   are stored starting on 128-byte boundaries.
+*/
+
+   n_total = 0 ;
+   n_prior = n_inputs ;
+   for (i=0 ; i<n_layers-1 ; i++) {
+      n_total += nhid_cols[i] * (n_prior + 1) ;  // Columns times rows in this layer
+      n_prior = nhid[i] ;                        // Mult is included in nhid_cols, which is actual
+      }
+
+   n_hid_weights = n_total ;  // Needed in cuda_cpx_weights_to_device()
+
+   memsize = n_total * sizeof(float) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &hidden_weights , (size_t) memsize ) ;
+
+   memsize = (n_layers-1) * sizeof(float *) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_whid , (size_t) memsize ) ;
+
+   cudaMemcpyToSymbol ( d_whid , &h_whid , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   n_total = 0 ;
+   n_prior = n_inputs ;
+   for (i=0 ; i<n_layers-1 ; i++) {
+      fptr[i] = hidden_weights + n_total ;
+      n_total += nhid_cols[i] * (n_prior + 1) ;  // Columns times rows in this layer
+      n_prior = nhid[i] ;                        // Mult is included in nhid_cols, which is actual
+      }
+
+   error_id = cudaMemcpy ( h_whid , &fptr[0] , (n_layers-1) * sizeof(float *) , cudaMemcpyHostToDevice ) ;
+
+/*
+   Output weights
+*/
+
+   n_out_weights = ntarg_cols * (nhid[n_layers-2]+1) ;  // Actual because ntarg_cols includes mult
+   memsize = n_out_weights * sizeof(float) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_wout , (size_t) memsize ) ;
+   error_id = cudaMemcpyToSymbol ( d_wout , &h_wout , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+
+/*
+   This delta, next delta
+*/
+
+   n_max = ntarg ;
+   for (i=1 ; i<n_layers-1 ; i++) {  // We do not store delta for first hidden layer, so skip 0
+      if (nhid[i] > n_max)
+         n_max = nhid[i] ;           // Complex
+      }
+
+   memsize = mult * n_max * max_batch * sizeof(double) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_this_delta , (size_t) memsize ) ;
+   error_id = cudaMemcpyToSymbol ( d_this_delta , &h_this_delta , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   memsize = mult * n_max * max_batch * sizeof(double) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_prior_delta , (size_t) memsize ) ;
+   error_id = cudaMemcpyToSymbol ( d_prior_delta , &h_prior_delta , sizeof(float *) , 0 , cudaMemcpyHostToDevice ) ;
+
+/*
+   Gradient (all layers, including output); grad_ptr
+*/
+
+   h_gradlen = 0 ;
+   n_prior = n_inputs ;
+   for (i=0 ; i<n_layers-1 ; i++) {
+      h_gradlen += mult * nhid[i] * (n_prior + 1) ;
+      n_prior = nhid[i] ;
+      }
+   h_gradlen += mult * ntarg * (n_prior + 1) ;
+   cudaMemcpyToSymbol ( d_gradlen , &h_gradlen , sizeof(int) , 0 , cudaMemcpyHostToDevice ) ;
+
+   memsize = h_gradlen * max_batch * sizeof(float) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_gradient , (size_t) memsize ) ;
+
+   cudaMemcpyToSymbol ( d_gradient , &h_gradient , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   memsize = n_layers * sizeof(float *) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_grad_ptr , (size_t) memsize ) ;
+
+   cudaMemcpyToSymbol ( d_grad_ptr , &h_grad_ptr , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   gptr = h_gradient ;
+   for (i=0 ; i<n_layers ; i++) {
+      fptr[i] = gptr ;
+
+      if (i == 0) {                        // First hidden layer?
+         n = mult * nhid[i] * (n_inputs+1) ;
+         gptr += n ;
+         }
+
+      else if (i < n_layers-1) {           // Subsequent hidden layer?
+         n = mult * nhid[i] * (nhid[i-1]+1) ;
+         gptr += n ;
+         }
+      }
+
+   error_id = cudaMemcpy ( h_grad_ptr , &fptr[0] , n_layers * sizeof(void *) , cudaMemcpyHostToDevice ) ;
+
+/*
+   MSE reduction stuff
+*/
+
+   memsize = REDUC_BLOCKS * sizeof(float) ;
+   total_memory += memsize ;
+   error_id = cudaMalloc ( (void **) &h_mse_out , (size_t) memsize ) ;
+   cudaMemcpyToSymbol ( d_mse_out , &h_mse_out , sizeof(void *) , 0 , cudaMemcpyHostToDevice ) ;
+
+   reduc_fdata = (float *) MALLOC ( REDUC_BLOCKS * sizeof(float) ) ;
+
+/*
+   Allocate fdata large enough to handle all subsequent double <-> float transactions
+*/
+
+   k = h_gradlen ;
+   if (n_out_weights > k)
+      k = n_out_weights ;
+   if (n_hid_weights > k)
+      k = n_hid_weights ;
+   fdata = (float *) MALLOC ( k * sizeof(float) ) ;
+
+
+/*
+   Set cache/shared memory preferences
+*/
+
+   error_id = cudaFuncSetCacheConfig ( device_cpx_hidden_activation_r , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_hidden_activation_c , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_hidden_activation_d , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_output_activation_r , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_output_activation_c , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_output_delta , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_softmax_delta , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_output_gradient_r , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_output_gradient_c , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_first_hidden_gradient_r , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_first_hidden_gradient_c , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_subsequent_hidden_gradient_r , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_subsequent_hidden_gradient_c , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_move_delta , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_softmax , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_fetch_gradient , cudaFuncCachePreferL1 ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_mse  , cudaFuncCachePreferNone ) ;
+   error_id = cudaFuncSetCacheConfig ( device_cpx_ll  , cudaFuncCachePreferNone ) ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   cuda_cpx_weights_to_device - Called from CPX_CUDA.CPP to copy weights
+
+--------------------------------------------------------------------------------
+*/
+
+int cuda_cpx_weights_to_device (
+   int n_inputs ,
+   int ntarg ,
+   int n_layers ,
+   int *nhid ,
+   double **hid_weights ,
+   double *final_layer_weights )
+{
+   int n_prior, ilayer, ineuron, ivar, ntarg_cols_each, nhid_cols_each ;
+   double *wptr ;
+   float *fptr ;
+   char msg[256] ;
+   cudaError_t error_id ;
+   
+   fptr = fdata ;
+   n_prior = n_inputs ;
+
+   for (ilayer=0 ; ilayer<n_layers-1 ; ilayer++) {
+      wptr = hid_weights[ilayer] ;
+      nhid_cols_each = (nhid[ilayer] + 31) / 32 * 32 ;  // For memory alignment to 128 bytes
+      for (ivar=0 ; ivar<=n_prior ; ivar++) {
+         // Real part
+         for (ineuron=0 ; ineuron<nhid[ilayer] ; ineuron++)
+            *fptr++ = (float) wptr[mult*(ineuron*(n_prior+1)+ivar)] ;
+         while (ineuron++ < nhid_cols_each)
+            *fptr++ = 0.0f ;
+         // Imaginary part
+         if (is_complex) {
+            for (ineuron=0 ; ineuron<nhid[ilayer] ; ineuron++)
+               *fptr++ = (float) wptr[2*(ineuron*(n_prior+1)+ivar)+1] ;
+            while (ineuron++ < nhid_cols_each)
+               *fptr++ = 0.0f ;
+            }
+         }
+      n_prior = nhid[ilayer] ;
+      }
+
+   assert ( fptr == fdata + n_hid_weights ) ;
+
+   error_id = cudaMemcpy ( hidden_weights , fdata , n_hid_weights * sizeof(float) , cudaMemcpyHostToDevice ) ;
+
+   fptr = fdata ;
+   wptr = final_layer_weights ;
+   ntarg_cols_each = (ntarg + 31) / 32 * 32 ;  // For memory alignment to 128 bytes
+
+   for (ivar=0 ; ivar<=n_prior ; ivar++) {  // Store as transpose so outputs can be computed in parallel
+      // Real part
+      for (ineuron=0 ; ineuron<ntarg ; ineuron++)
+         *fptr++ = (float) wptr[mult*(ineuron*(n_prior+1)+ivar)] ;
+      while (ineuron++ < ntarg_cols_each)
+         *fptr++ = 0.0f ;
+
+      if (is_complex) {
+         // Imaginary part
+         for (ineuron=0 ; ineuron<ntarg ; ineuron++)
+            *fptr++ = (float) wptr[2*(ineuron*(n_prior+1)+ivar)+1] ;
+         while (ineuron++ < ntarg_cols_each)
+            *fptr++ = 0.0f ;
+         }
+      }
+
+   assert ( fptr == fdata + n_out_weights ) ;
+
+   error_id = cudaMemcpy ( h_wout , fdata , n_out_weights * sizeof(float) , cudaMemcpyHostToDevice ) ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   hidden_activation - Compute activations for a single hidden layer
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_hidden_activation_r (    // Real domain version
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int ilayer         // Layer to process
+   )
+{
+   int icase, ihid, i_input, n_inputs, nhid_cols ;
+   float *f_inptr, *wptr ;
+   double sum, *actptr, *d_inptr ;
+
+   ihid = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (ihid >= d_nhid[ilayer])
+      return ;
+
+   nhid_cols = d_nhid_cols[ilayer] ;
+
+   icase = blockIdx.y ;
+
+   wptr = d_whid[ilayer] + ihid ;
+   actptr = d_act[ilayer] ;
+   sum = 0.0 ;
+
+   if (ilayer == 0) {
+      n_inputs = d_n_trn_inputs ;
+      f_inptr = d_trn_data + (icase+istart)*n_inputs ;
+      for (i_input=0 ; i_input<n_inputs ; i_input++) {
+         sum += *wptr * f_inptr[i_input] ;
+         wptr += nhid_cols ;
+         }
+      sum += *wptr ;   // Bias
+      }
+
+   else {
+      n_inputs = d_nhid[ilayer-1] ;
+      d_inptr = d_act[ilayer-1] + icase*n_inputs ;
+      for (i_input=0 ; i_input<n_inputs ; i_input++) {
+         sum += *wptr * d_inptr[i_input] ;
+         wptr += nhid_cols ;
+         }
+      sum += *wptr ;   // Bias
+      }
+
+   actptr[icase*d_nhid[ilayer]+ihid] = 1.0 / (1.0 + __expf(-sum)) ;
+}
+
+__global__ void device_cpx_hidden_activation_c (    // Complex domain version
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int ilayer         // Layer to process
+   )
+{
+   int k, icase, ihid, i_input, n_inputs, nhid_cols ;
+   float *f_inptr, *wptr ;
+   double rsum, isum, *actptr, *d_inptr, len_sq, raw_length, squashed_length, ratio ;
+
+   ihid = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (ihid >= d_nhid[ilayer])
+      return ;
+
+   nhid_cols = d_nhid_cols[ilayer] ;   // Actual, a multiple of 128 bytes (32 floats)
+   k = nhid_cols / 2 ;                 // Real and imaginary parts of weights separated by this
+
+   icase = blockIdx.y ;
+
+   wptr = d_whid[ilayer] + ihid ;
+   actptr = d_act[ilayer] + 2 * (icase * d_nhid[ilayer] + ihid) ;
+   rsum = isum = 0.0 ;
+
+   if (ilayer == 0) {
+      n_inputs = d_n_trn_inputs ;                        // Complex
+      f_inptr = d_trn_data + (icase+istart)*2*n_inputs ;
+      for (i_input=0 ; i_input<n_inputs ; i_input++) {
+         rsum += *wptr * *f_inptr - *(wptr+k) * *(f_inptr+1) ;
+         isum += *wptr * *(f_inptr+1) + *(wptr+k) * *f_inptr ;
+         wptr += nhid_cols ;
+         f_inptr += 2 ;
+         }
+      rsum += *wptr ;     // Bias
+      isum += *(wptr+k) ;
+      }
+
+   else {
+      n_inputs = d_nhid[ilayer-1] ;
+      d_inptr = d_act[ilayer-1] + icase*2*n_inputs ;
+      for (i_input=0 ; i_input<n_inputs ; i_input++) {
+         rsum += *wptr * *d_inptr - *(wptr+k) * *(d_inptr+1) ;
+         isum += *wptr * *(d_inptr+1) + *(wptr+k) * *d_inptr ;
+         wptr += nhid_cols ;
+         d_inptr += 2 ;
+         }
+      rsum += *wptr ;     // Bias
+      isum += *(wptr+k) ;
+      }
+
+   len_sq = rsum * rsum + isum * isum + 1.e-60 ;
+   raw_length = sqrt ( len_sq ) ;
+   squashed_length = tanh ( 1.5 * raw_length ) ;
+   ratio = squashed_length / raw_length ;
+
+   *actptr =     rsum * ratio ;
+   *(actptr+1) = isum * ratio ;
+}
+
+__global__ void device_cpx_hidden_activation_d (    // Complex domain version with derivatives
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int ilayer         // Layer to process
+   )
+{
+   int k, icase, ihid, i_input, n_inputs, nhid_cols ;
+   float *f_inptr, *wptr ;
+   double rsum, isum, *d_inptr, len_sq, raw_length, squashed_length, ratio ;
+   double *actptr, *drrptr, *diiptr, *driptr, deriv, temp ;
+
+   ihid = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (ihid >= d_nhid[ilayer])
+      return ;
+
+   nhid_cols = d_nhid_cols[ilayer] ;   // Actual, a multiple of 128 bytes (32 floats)
+   k = nhid_cols / 2 ;                 // Real and imaginary parts of weights separated by this
+
+   icase = blockIdx.y ;
+
+   wptr = d_whid[ilayer] + ihid ;
+   actptr = d_act[ilayer] + 2 * (icase * d_nhid[ilayer] + ihid) ;
+   drrptr = d_drr[ilayer] ;
+   diiptr = d_dii[ilayer] ;
+   driptr = d_dri[ilayer] ;
+   rsum = isum = 0.0 ;
+
+   if (ilayer == 0) {
+      n_inputs = d_n_trn_inputs ;                        // Complex
+      f_inptr = d_trn_data + (icase+istart)*2*n_inputs ;
+      for (i_input=0 ; i_input<n_inputs ; i_input++) {
+         rsum += *wptr * *f_inptr - *(wptr+k) * *(f_inptr+1) ;
+         isum += *wptr * *(f_inptr+1) + *(wptr+k) * *f_inptr ;
+         wptr += nhid_cols ;
+         f_inptr += 2 ;
+         }
+      rsum += *wptr ;     // Bias
+      isum += *(wptr+k) ;
+      }
+
+   else {
+      n_inputs = d_nhid[ilayer-1] ;
+      d_inptr = d_act[ilayer-1] + icase*2*n_inputs ;
+      for (i_input=0 ; i_input<n_inputs ; i_input++) {
+         rsum += *wptr * *d_inptr - *(wptr+k) * *(d_inptr+1) ;
+         isum += *wptr * *(d_inptr+1) + *(wptr+k) * *d_inptr ;
+         wptr += nhid_cols ;
+         d_inptr += 2 ;
+         }
+      rsum += *wptr ;     // Bias
+      isum += *(wptr+k) ;
+      }
+
+   len_sq = rsum * rsum + isum * isum + 1.e-60 ;
+   raw_length = sqrt ( len_sq ) ;
+   squashed_length = tanh ( 1.5 * raw_length ) ;
+   ratio = squashed_length / raw_length ;
+
+   *actptr =     rsum * ratio ;
+   *(actptr+1) = isum * ratio ;
+
+   deriv = 1.5 * (1.0 - squashed_length * squashed_length) ;
+   temp = (deriv - ratio) / len_sq ;
+
+   k = icase * d_nhid[ilayer] + ihid ;
+   drrptr[k] = ratio + rsum * rsum * temp ;
+   diiptr[k] = ratio + isum * isum * temp ;
+   driptr[k] = rsum * isum * temp ;
+}
+
+int cuda_cpx_hidden_activation (
+   int istart ,    // First case in this batch
+   int istop ,     // One past last case
+   int nhid ,      // Number of hidden neurons in this layer
+   int ilayer ,    // Layer to process
+   int need_deriv  // Also compute derivatives?
+   )
+{
+   int warpsize, threads_per_block ;
+   char msg[256] ;
+   dim3 block_launch ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (nhid + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (nhid + threads_per_block - 1) / threads_per_block ;
+   block_launch.y = istop - istart ;
+   block_launch.z = 1 ;
+
+   if (is_complex  &&  need_deriv)
+      device_cpx_hidden_activation_d <<< block_launch , threads_per_block >>> ( istart , istop , ilayer ) ;   
+   else if (is_complex)
+      device_cpx_hidden_activation_c <<< block_launch , threads_per_block >>> ( istart , istop , ilayer ) ;   
+   else
+      device_cpx_hidden_activation_r <<< block_launch , threads_per_block >>> ( istart , istop , ilayer ) ;   
+
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   output_activation - Compute activations for the output layer
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_output_activation_r (
+   int istart        // First case in this batch
+   )
+{
+   int icase, iout, n_inputs, i_input, ilayer ;
+   double sum, *inptr ;
+   float *wptr ;
+
+   iout = blockIdx.x * blockDim.x + threadIdx.x ;
+   ilayer = d_n_layers - 2 ;
+   n_inputs = d_nhid[ilayer] ;
+
+   if (iout >= d_ntarg)
+      return ;
+
+   icase = blockIdx.y ;
+   wptr = d_wout + iout ;
+
+   inptr = d_act[ilayer] + icase * n_inputs ;
+   sum = 0.0 ;
+
+   for (i_input=0 ; i_input<n_inputs ; i_input++) {   // wout is transpose of Host, with target changing fastest
+      sum += *wptr * inptr[i_input] ;
+      wptr += d_ntarg_cols ;
+      }
+   sum += *wptr ;  // Bias
+
+   d_output[(icase+istart)*d_ntarg+iout] = sum ;
+}
+
+__global__ void device_cpx_output_activation_c (
+   int istart        // First case in this batch
+   )
+{
+   int k, icase, iout, n_inputs, i_input, ilayer ;
+   double rsum, isum, *inptr ;
+   float *wptr ;
+
+   iout = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (iout >= d_ntarg)
+      return ;
+
+   ilayer = d_n_layers - 2 ;
+   n_inputs = d_nhid[ilayer] ;
+
+   icase = blockIdx.y ;
+   wptr = d_wout + iout ;
+
+   inptr = d_act[ilayer] + icase * 2 * n_inputs ;
+   rsum = isum = 0.0 ;
+   k = d_ntarg_cols / 2 ;   // Real and imaginary parts of weights separated by this
+
+   for (i_input=0 ; i_input<n_inputs ; i_input++) {   // wout is transpose of Host, with target changing fastest
+      rsum += *wptr * *inptr - *(wptr+k) * *(inptr+1) ;
+      isum += *wptr * *(inptr+1) + *(wptr+k) * *inptr ;
+      wptr += d_ntarg_cols ;
+      inptr += 2 ;
+      }
+   rsum += *wptr ;     // Bias
+   isum += *(wptr+k) ;
+
+   k = 2*((icase+istart)*d_ntarg+iout) ;
+   d_output[k] =   rsum ;
+   d_output[k+1] = isum ;
+}
+
+int cuda_cpx_output_activation (
+   int istart ,    // First case in this batch
+   int istop ,     // One past last case
+   int ntarg       // Number of targets (outputs)
+   )
+{
+   int warpsize, threads_per_block ;
+   char msg[256] ;
+   dim3 block_launch ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (ntarg + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (ntarg + threads_per_block - 1) / threads_per_block ;
+   block_launch.y = istop - istart ;
+   block_launch.z = 1 ;
+
+   if (is_complex)
+      device_cpx_output_activation_c <<< block_launch , threads_per_block >>> ( istart ) ;   
+   else
+      device_cpx_output_activation_r <<< block_launch , threads_per_block >>> ( istart ) ;   
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   output_delta - Put output delta into this_delta
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_output_delta (
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int ntarg          // Number of targets (outputs)
+   )
+{
+   int j, k, icase, iout ;
+
+   iout = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (iout >= d_ntarg)
+      return ;
+
+   icase = blockIdx.y ;
+
+/*
+   If we are autoencoding, d_targets points to the inputs,
+   which are full complex if this is a complex model.
+   In all other cases, the targets are strictly real.
+*/
+
+   if (d_autoencode) {
+      if (d_complex) {
+         j = 2 * (icase * ntarg + iout ) ;
+         k = 2 * ((icase + istart) * ntarg + iout) ;
+         d_this_delta[j]   = 2.0 * (d_targets[k] - d_output[k]) ;
+         d_this_delta[j+1] = 2.0 * (d_targets[k+1] - d_output[k+1]) ;
+         }
+      else {
+         k = (icase + istart) * ntarg + iout ;
+         d_this_delta[icase*ntarg+iout] = 2.0 * (d_targets[k] - d_output[k]) ;
+         }
+      }
+
+/*
+   If we are not autoencoding, d_targets is strictly real
+   and we ignore the imaginary part of predictions.
+*/
+
+   else {
+      j = d_mult * (icase * ntarg + iout) ;
+      k = (icase+istart)*ntarg+iout ;
+      d_this_delta[j] = 2.0 * (d_targets[k] - d_output[d_mult*k]) ;
+      if (d_complex)
+         d_this_delta[j+1] = 0.0 ;
+      }
+}
+
+__global__ void device_cpx_softmax_delta (
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int ntarg          // Number of targets (outputs)
+   )
+{
+   int icase, iout ;
+
+   iout = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (iout >= d_ntarg)
+      return ;
+
+   icase = blockIdx.y ;
+
+   d_this_delta[d_mult*(icase*ntarg+iout)] = ( ((iout == d_class[icase+istart])  ?  1.0 : 0.0) -
+                                                 d_output[d_mult*((icase+istart)*ntarg+iout)]) ;
+   if (d_complex)
+      d_this_delta[2*(icase*ntarg+iout)+1] = 0.0 ;
+}
+
+int cuda_cpx_output_delta (
+   int istart ,      // First case in this batch
+   int istop ,       // One past last case
+   int classifier ,  // Is this a classifier (SoftMax outputs)?
+   int ntarg         // Number of targets (outputs)
+   )
+{
+   int warpsize, threads_per_block ;
+   char msg[256] ;
+   dim3 block_launch ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (ntarg + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (ntarg + threads_per_block - 1) / threads_per_block ;
+   block_launch.y = istop - istart ;
+   block_launch.z = 1 ;
+
+   if (classifier)
+      device_cpx_softmax_delta <<< block_launch , threads_per_block >>> ( istart , istop , ntarg ) ;   
+   else
+      device_cpx_output_delta <<< block_launch , threads_per_block >>> ( istart , istop , ntarg ) ;   
+
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   output_gradient - Compute output layer gradient
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_output_gradient_r (
+   int nc ,        // Number of cases in batch
+   int ilayer      // Hidden layer which feeds the output layer
+   )
+{
+   int icase, iout, ihid, nhid ;
+   float *gptr ;
+   double input ;
+
+   ihid = blockIdx.x * blockDim.x + threadIdx.x ;
+   nhid = d_nhid[ilayer] ;       // Neurons in last hidden layer
+   icase = blockIdx.y ;
+
+   if (ihid > nhid)
+      return ;
+   else if (ihid < nhid)
+      input = d_act[ilayer][icase*nhid+ihid] ;
+   else
+      input = 1.0 ;              // Bias
+
+   iout = blockIdx.z ;
+
+   gptr = d_grad_ptr[ilayer+1] + icase * d_gradlen ; // Gradient of output layer
+
+   gptr[iout*(nhid+1)+ihid] = d_this_delta[icase*d_ntarg+iout] * input ;
+}
+
+__global__ void device_cpx_output_gradient_c (
+   int nc ,        // Number of cases in batch
+   int ilayer      // Hidden layer which feeds the output layer
+   )
+{
+   int k, icase, iout, ihid, nhid ;
+   float *gptr ;
+   double r_delta, i_delta, r_prev, i_prev ;
+
+   ihid = blockIdx.x * blockDim.x + threadIdx.x ;
+   nhid = d_nhid[ilayer] ;       // Neurons in last hidden layer
+   icase = blockIdx.y ;
+
+   if (ihid > nhid)
+      return ;
+   else if (ihid < nhid) {
+      k = 2 * (icase * nhid + ihid) ;
+      r_prev = d_act[ilayer][k] ;
+      i_prev = d_act[ilayer][k+1] ;
+      }
+   else {
+      r_prev = 1.0 ;              // Bias
+      i_prev = 0.0 ;
+      }
+
+   iout = blockIdx.z ;
+
+   k = 2 * (icase * d_ntarg + iout) ;
+   r_delta = d_this_delta[k] ;
+   i_delta = d_this_delta[k+1] ;
+   gptr = d_grad_ptr[ilayer+1] + icase * d_gradlen ; // Gradient of output layer
+
+   k = 2 * (iout * (nhid + 1) + ihid) ;
+   gptr[k] =    r_delta * r_prev  +  i_delta * i_prev ;
+   gptr[k+1] = -r_delta * i_prev  +  i_delta * r_prev ;
+}
+
+int cuda_cpx_output_gradient (
+   int nc ,        // Number of cases in batch
+   int nhid ,      // Number of neurons in last hidden layer
+   int ilayer ,    // And its layer index
+   int ntarg       // Number of targets (outputs)
+   )
+{
+   int warpsize, threads_per_block ;
+   char msg[256] ;
+   dim3 block_launch ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (nhid + 1 + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (nhid + 1 + threads_per_block - 1) / threads_per_block ; // Include bias
+   block_launch.y = nc ;
+   block_launch.z = ntarg ;
+
+   if (is_complex)
+      device_cpx_output_gradient_c <<< block_launch , threads_per_block >>> ( nc , ilayer ) ;   
+   else
+      device_cpx_output_gradient_r <<< block_launch , threads_per_block >>> ( nc , ilayer ) ;   
+
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   first_hidden_gradient - Compute gradient for first hidden layer
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_first_hidden_gradient_r (
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int only_hidden    // Is this the only hidden layer?
+   )
+{
+   int j, icase, iin, ihid, nhid, ninp1, n_next ;
+   float *gptr, *next_weights, input ;
+   double *delta_ptr, this_act, delta ;
+
+   iin = blockIdx.x * blockDim.x + threadIdx.x ;
+   icase = blockIdx.y ;
+
+   if (iin > d_n_trn_inputs)
+      return ;
+   else if (iin < d_n_trn_inputs)
+      input = d_trn_data[(icase+istart)*d_n_trn_inputs+iin] ;  // Feed coming into this layer
+   else
+      input = 1.0f ;             // Bias
+
+   ihid = blockIdx.z ;
+   nhid = d_nhid[0] ;            // Neurons in this hidden layer
+   ninp1 = d_n_trn_inputs + 1 ;  // We mustn't forget the bias
+
+   if (only_hidden) {
+      n_next = d_ntarg ;
+      next_weights = d_wout + ihid * d_ntarg_cols ;
+      }
+   else {
+      n_next = d_nhid[1] ;                               // This many neurons in next layer
+      next_weights = d_whid[1] + ihid * d_nhid_cols[1] ; // Their weights start here
+      }
+
+   delta_ptr = d_this_delta + icase * n_next ; // Delta for this case
+
+   delta = 0.0 ;
+   for (j=0 ; j<n_next ; j++)
+      delta += delta_ptr[j] * next_weights[j] ;
+   this_act = d_act[0][icase*nhid+ihid] ;
+   delta *= this_act * (1.0 - this_act) ;
+
+   gptr = d_grad_ptr[0] + icase * d_gradlen ;  // Gradient of first hidden layer
+   gptr[ihid*ninp1+iin] = delta * input ;
+}
+
+__global__ void device_cpx_first_hidden_gradient_c (
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int only_hidden    // Is this the only hidden layer?
+   )
+{
+   int j, k, icase, iin, ihid, nhid, n_next ;
+   float *gptr, *next_weights ;
+   double *delta_ptr, drr, dii, dri ;
+   double r_delta, i_delta, r_prev, i_prev, rsum, isum ;
+
+   iin = blockIdx.x * blockDim.x + threadIdx.x ;
+   icase = blockIdx.y ;
+
+   if (iin > d_n_trn_inputs)
+      return ;
+
+   else if (iin < d_n_trn_inputs) {
+      j = 2 * ((icase + istart) * d_n_trn_inputs + iin) ;
+      r_prev = d_trn_data[j] ;
+      i_prev = d_trn_data[j+1] ;
+      }
+
+   else {
+      r_prev = 1.0 ;             // Bias
+      i_prev = 0.0 ;
+      }
+
+   ihid = blockIdx.z ;
+   nhid = d_nhid[0] ;            // Neurons in this hidden layer
+
+   if (only_hidden) {            // Next layer is output layer?
+      n_next = d_ntarg ;
+      next_weights = d_wout + ihid * d_ntarg_cols ;
+      k = d_ntarg_cols / 2 ;     // Real and imaginary parts are separated by this
+      }
+   else {
+      n_next = d_nhid[1] ;                               // This many neurons in next layer
+      next_weights = d_whid[1] + ihid * d_nhid_cols[1] ; // Their weights start here
+      k = d_nhid_cols[1] / 2 ;
+      }
+
+   delta_ptr = d_this_delta + icase * 2 * n_next ;       // Delta for this case
+
+   rsum = isum = 0.0 ;
+   for (j=0 ; j<n_next ; j++) {
+      rsum +=  delta_ptr[2*j]   * next_weights[j] +
+               delta_ptr[2*j+1] * next_weights[j+k] ;
+      isum += -delta_ptr[2*j]   * next_weights[j+k] +
+               delta_ptr[2*j+1] * next_weights[j] ;
+      }
+
+   j = icase * nhid + ihid ;
+   drr = d_drr[0][j] ;
+   dii = d_dii[0][j] ;
+   dri = d_dri[0][j] ;
+
+   r_delta = rsum * drr + isum * dri ;
+   i_delta = rsum * dri + isum * dii ;
+
+   gptr = d_grad_ptr[0] + icase * d_gradlen ;  // Gradient of first hidden layer
+   j = 2 * (ihid * (d_n_trn_inputs + 1) + iin) ;
+   gptr[j] =    r_delta * r_prev  +  i_delta * i_prev ;
+   gptr[j+1] = -r_delta * i_prev  +  i_delta * r_prev ;
+}
+
+int cuda_cpx_first_hidden_gradient (
+   int istart ,       // First case in this batch
+   int istop ,        // One past last case
+   int nin ,          // Number of model inputs
+   int nhid ,         // Number of neurons in this layer
+   int only_hidden    // Is this the only hidden layer?
+   )
+{
+   int warpsize, threads_per_block ;
+   char msg[256] ;
+   dim3 block_launch ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (nin + 1 + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (nin + 1 + threads_per_block - 1) / threads_per_block ; // Include bias
+   block_launch.y = istop - istart ;
+   block_launch.z = nhid ;
+
+   if (is_complex)
+      device_cpx_first_hidden_gradient_c <<< block_launch , threads_per_block >>> ( istart , istop , only_hidden ) ;   
+   else
+      device_cpx_first_hidden_gradient_r <<< block_launch , threads_per_block >>> ( istart , istop , only_hidden ) ;   
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+-----------------------------------------------------------------------------------
+
+   subsequent_hidden_gradient - Compute gradient for hidden layers other than first
+
+-----------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_subsequent_hidden_gradient_r (
+   int nc ,           // Number of cases in batch
+   int ilayer ,       // Hidden layer being processed
+   int last_hidden    // Is this the last hidden layer?
+   )
+{
+   int j, icase, iin, ihid, nhid, nin, ninp1, n_next ;
+   float *gptr, *next_weights ;
+   double *delta_ptr, *prior_delta_ptr, this_act, delta, input ;
+
+   iin = blockIdx.x * blockDim.x + threadIdx.x ;
+   icase = blockIdx.y ;
+   nin = d_nhid[ilayer-1] ;      // Number of inputs to each neuron in this layer
+
+   if (iin > nin)
+      return ;
+   else if (iin < nin)
+      input = d_act[ilayer-1][icase*nin+iin] ;
+   else
+      input = 1.0 ;              // Bias
+
+   ihid = blockIdx.z ;
+   nhid = d_nhid[ilayer] ;       // Neurons in this hidden layer
+   ninp1 = nin + 1 ;             // We mustn't forget the bias, so nin+1
+
+   if (last_hidden) {
+      n_next = d_ntarg ;
+      next_weights = d_wout + ihid * d_ntarg_cols ;
+      }
+   else {
+      n_next = d_nhid[ilayer+1] ;
+      next_weights = d_whid[ilayer+1] + ihid * d_nhid_cols[ilayer+1] ;
+      }
+
+   delta_ptr = d_this_delta + icase * n_next ;      // Coming from the next layer, which was just done
+   prior_delta_ptr = d_prior_delta + icase * nhid ; // Save for the next layer done, one layer back
+
+   delta = 0.0 ;
+   for (j=0 ; j<n_next ; j++)
+      delta += delta_ptr[j] * next_weights[j] ;
+   this_act = d_act[ilayer][icase*nhid+ihid] ;
+   delta *= this_act * (1.0 - this_act) ;
+   prior_delta_ptr[ihid] = delta ;            // Save it for the next layer back
+
+   gptr = d_grad_ptr[ilayer] + icase * d_gradlen ;  // Gradient of this hidden layer
+   gptr[ihid*ninp1+iin] = delta * input ;
+}
+
+__global__ void device_cpx_subsequent_hidden_gradient_c (
+   int nc ,           // Number of cases in batch
+   int ilayer ,       // Hidden layer being processed
+   int last_hidden    // Is this the last hidden layer?
+   )
+{
+   int j, k, icase, iin, ihid, nhid, nin, n_next ;
+   float *gptr, *next_weights ;
+   double *delta_ptr, *prior_delta_ptr, drr, dii, dri ;
+   double r_delta, i_delta, r_prev, i_prev, rsum, isum ;
+
+   iin = blockIdx.x * blockDim.x + threadIdx.x ;
+   icase = blockIdx.y ;
+   nin = d_nhid[ilayer-1] ;      // Number of inputs to each neuron in this layer
+
+   if (iin > nin)
+      return ;
+   else if (iin < nin) {
+      j = 2 * (icase * nin + iin) ;
+      r_prev = d_act[ilayer-1][j] ;
+      i_prev = d_act[ilayer-1][j+1] ;
+      }
+   else {
+      r_prev = 1.0 ;             // Bias
+      i_prev = 0.0 ;
+      }
+
+   ihid = blockIdx.z ;
+   nhid = d_nhid[ilayer] ;       // Neurons in this hidden layer
+
+   if (last_hidden) {            // Next layer is output layer?
+      n_next = d_ntarg ;
+      next_weights = d_wout + ihid * d_ntarg_cols ;
+      k = d_ntarg_cols / 2 ;     // Real and imaginary parts are separated by this
+      }
+   else {
+      n_next = d_nhid[ilayer+1] ;
+      next_weights = d_whid[ilayer+1] + ihid * d_nhid_cols[ilayer+1] ;
+      k = d_nhid_cols[ilayer+1] / 2 ;
+      }
+
+   delta_ptr = d_this_delta + icase * 2 * n_next ;      // Coming from the next layer, which was just done
+   prior_delta_ptr = d_prior_delta + icase * 2 * nhid ; // Save for the next layer done, one layer back
+
+   rsum = isum = 0.0 ;
+   for (j=0 ; j<n_next ; j++) {
+      rsum +=  delta_ptr[2*j]   * next_weights[j] +
+               delta_ptr[2*j+1] * next_weights[j+k] ;
+      isum += -delta_ptr[2*j]   * next_weights[j+k] +
+               delta_ptr[2*j+1] * next_weights[j] ;
+      }
+
+   j = icase * nhid + ihid ;
+   drr = d_drr[ilayer][j] ;
+   dii = d_dii[ilayer][j] ;
+   dri = d_dri[ilayer][j] ;
+
+   r_delta = rsum * drr + isum * dri ;
+   i_delta = rsum * dri + isum * dii ;
+
+   prior_delta_ptr[2*ihid] = r_delta ;            // Save it for the next layer back
+   prior_delta_ptr[2*ihid+1] = i_delta ;
+
+   gptr = d_grad_ptr[ilayer] + icase * d_gradlen ;  // Gradient of this hidden layer
+   j = 2 * (ihid * (nin + 1) + iin) ;
+   gptr[j] =    r_delta * r_prev  +  i_delta * i_prev ;
+   gptr[j+1] = -r_delta * i_prev  +  i_delta * r_prev ;
+}
+
+
+__global__ void device_cpx_move_delta (
+   int nhid      // Number of neurons in the layer just processed
+   )
+{
+   int k, ihid ;
+
+   ihid = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (ihid >= nhid)
+      return ;
+
+   k = d_mult * (blockIdx.y * nhid + ihid) ;  // y is case number
+
+   d_this_delta[k] = d_prior_delta[k] ;
+   if (d_complex)
+      d_this_delta[k+1] = d_prior_delta[k+1] ;
+}
+
+int cuda_cpx_subsequent_hidden_gradient (
+   int nc ,           // Number of cases in batch
+   int ilayer ,       // Hidden layer being processed
+   int nhid_this ,    // Number of hidden neurons in this layer
+   int nhid_prior ,   // And in prior layer
+   int last_hidden    // Is this the last hidden layer?
+   )
+{
+   int warpsize, threads_per_block ;
+   char msg[256] ;
+   dim3 block_launch ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (nhid_prior + 1 + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (nhid_prior + 1 + threads_per_block - 1) / threads_per_block ; // Include bias
+   block_launch.y = nc ;
+   block_launch.z = nhid_this ;
+
+   if (is_complex)
+      device_cpx_subsequent_hidden_gradient_c <<< block_launch , threads_per_block >>> ( nc , ilayer , last_hidden ) ;   
+   else
+      device_cpx_subsequent_hidden_gradient_r <<< block_launch , threads_per_block >>> ( nc , ilayer , last_hidden ) ;   
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+/*
+   Move deltas from prior to current to prepare for next layer back
+*/
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (nhid_this + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   block_launch.x = (nhid_this + threads_per_block - 1) / threads_per_block ;
+   block_launch.y = nc ;
+   block_launch.z = 1 ;
+
+   device_cpx_move_delta <<< block_launch , threads_per_block >>> ( nhid_this ) ;   
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   softmax - Do SoftMax modification of outputs for a batch
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_softmax (
+   int istart ,       // First case in this batch
+   int istop          // One past last case
+   )
+{
+   int icase, iout ;
+   double *outptr, sum ;
+
+   icase = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (icase >= istop - istart)
+      return ;
+
+   outptr = d_output + (icase + istart) * d_mult * d_ntarg ;  // Output vector for this case
+   sum = 0.0 ;
+
+   for (iout=0 ; iout<d_ntarg ; iout++) {   // Imaginary part plays no role
+      if (outptr[d_mult*iout] < 300.0)
+         outptr[d_mult*iout] = __expf ( outptr[d_mult*iout] ) ;
+      else
+         outptr[d_mult*iout] = __expf ( 300.0 ) ;
+      sum += outptr[d_mult*iout] ;
+      }
+
+   for (iout=0 ; iout<d_ntarg ; iout++)
+      outptr[d_mult*iout] /= sum ;
+}
+
+int cuda_cpx_softmax (
+   int istart ,       // First case in this batch
+   int istop          // One past last case
+   )
+{
+   int n, warpsize, blocks_per_grid, threads_per_block ;
+   char msg[256] ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   n = istop - istart ;   // Number of elements
+
+   threads_per_block = (n + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   blocks_per_grid = (n + threads_per_block - 1) / threads_per_block ;
+
+   device_cpx_softmax <<< blocks_per_grid , threads_per_block >>> ( istart , istop ) ;   
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   fetch_gradient - Retrieve sum across batch of complete gradient
+
+--------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_fetch_gradient (
+   int nc          // Number of cases in batch
+   )
+{
+   int index, icase ;
+   float *gptr ;
+   double sum ;
+
+   index = blockIdx.x * blockDim.x + threadIdx.x ;
+
+   if (index >= d_gradlen)
+      return ;
+
+   sum = 0.0 ;
+   gptr = d_gradient + index ;
+   for (icase=0 ; icase<nc ; icase++)   // For all cases in this batch
+      sum += gptr[icase*d_gradlen] ;
+   *gptr = sum ;
+}
+
+int cuda_cpx_fetch_gradient (
+   int nc ,        // Number of cases in batch
+   double *grad    // Gradient sum output here
+   )
+{
+   int i, warpsize, blocks_per_grid, threads_per_block ;
+   char msg[256] ;
+   cudaError_t error_id ;
+
+   warpsize = deviceProp.warpSize ;      // Threads per warp, likely 32 well into the future
+
+   threads_per_block = (h_gradlen + warpsize - 1) / warpsize * warpsize ;
+   if (threads_per_block > 4 * warpsize)
+      threads_per_block = 4 * warpsize ;
+
+   blocks_per_grid = (h_gradlen + threads_per_block - 1) / threads_per_block ;
+
+   device_cpx_fetch_gradient <<< blocks_per_grid , threads_per_block >>> ( nc ) ;   
+   cudaDeviceSynchronize() ;
+   error_id = cudaGetLastError () ;
+
+   error_id = cudaMemcpy ( fdata , h_gradient , h_gradlen * sizeof(float) , cudaMemcpyDeviceToHost ) ;
+   for (i=0 ; i<h_gradlen ; i++)
+      grad[i] += fdata[i] ;
+
+   return 0 ;
+}
+
+
+/*
+------------------------------------------------------------------------------------------------
+
+   cuda_cpx_mse - Given output activations and targets, compute mse
+              This would be called after the entire training set is processed,
+              not in batches.
+             
+------------------------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_mse ()
+{
+   __shared__ double partial_mse[REDUC_THREADS] ;
+   int i, index ;
+   unsigned int n ;
+   double diff, sum_mse ;
+
+   index = threadIdx.x ;
+   n = d_ncases * d_ntarg ;
+   sum_mse = 0.0 ;   
+
+/*
+   If we are autoencoding, d_targets points to the inputs,
+   which are full complex if this is a complex model.
+   In all other cases, the targets are strictly real.
+*/
+
+   if (d_autoencode) {
+      if (d_complex) {
+         for (i=blockIdx.x*blockDim.x+index ; i<n ; i+=blockDim.x*gridDim.x) {
+            diff = d_output[2*i] - d_targets[2*i] ;
+            sum_mse += diff * diff ;
+            diff = d_output[2*i+1] - d_targets[2*i+1] ;
+            sum_mse += diff * diff ;
+            }
+         }
+      else {
+         for (i=blockIdx.x*blockDim.x+index ; i<n ; i+=blockDim.x*gridDim.x) {
+            diff = d_output[i] - d_targets[i] ;
+            sum_mse += diff * diff ;
+            }
+         }
+      }
+
+/*
+   If we are not autoencoding, d_targets is strictly real
+   and we ignore the imaginary part of predictions.
+*/
+
+   else {
+      for (i=blockIdx.x*blockDim.x+index ; i<n ; i+=blockDim.x*gridDim.x) {
+         diff = d_output[d_mult*i] - d_targets[i] ;   // Imaginary part is ignored
+         sum_mse += diff * diff ;
+         }
+      }
+
+   partial_mse[index] = sum_mse ;
+   __syncthreads() ;
+
+   for (i=blockDim.x>>1 ; i ; i>>=1) {
+      if (index < i)
+         partial_mse[index] += partial_mse[index+i] ;
+      __syncthreads() ;
+      }
+
+   if (index == 0)
+      d_mse_out[blockIdx.x] = partial_mse[0] ;
+}
+
+
+int cuda_cpx_mse (
+   int n ,           // Number of values; ncases * ntarg
+   double *mse       // Computed mse criterion
+   )
+{
+   int i, blocks_per_grid ;
+   double sum ;
+   char msg[256] ;
+   cudaError_t error_id ;
+
+   blocks_per_grid = (n + REDUC_THREADS - 1) / REDUC_THREADS ;
+   if (blocks_per_grid > REDUC_BLOCKS)
+      blocks_per_grid = REDUC_BLOCKS ;
+
+   device_cpx_mse <<< blocks_per_grid , REDUC_THREADS >>> () ;   
+   cudaDeviceSynchronize() ;
+
+   error_id = cudaGetLastError () ;
+   error_id = cudaMemcpy ( reduc_fdata , h_mse_out , blocks_per_grid * sizeof(float) , cudaMemcpyDeviceToHost ) ;
+
+   sum = 0.0 ;
+   for (i=0 ; i<blocks_per_grid ; i++)
+      sum += reduc_fdata[i] ;
+   *mse = sum / n ;
+
+   return 0 ;
+}
+
+
+/*
+------------------------------------------------------------------------------------------------
+
+   cuda_cpx_ll - Given output activations and targets, compute log likelihood
+             This would be called after the entire training set is processed,
+             not in batches.
+             
+------------------------------------------------------------------------------------------------
+*/
+
+__global__ void device_cpx_ll ()
+{
+   __shared__ double partial_ll[REDUC_THREADS] ;
+   int i, n, ntarg, index ;
+   double sum_ll ;
+
+   index = threadIdx.x ;
+   n = d_ncases ;
+   ntarg = d_ntarg ;
+
+   sum_ll = 0.0 ;   
+   for (i=blockIdx.x*blockDim.x+index ; i<n ; i+=blockDim.x*gridDim.x)
+      sum_ll -= log ( d_output[d_mult*(i*ntarg+d_class[i])] + 1.e-30 ) ; // Imaginary part plays no role
+
+   partial_ll[index] = sum_ll ;
+   __syncthreads() ;
+
+   for (i=blockDim.x>>1 ; i ; i>>=1) {
+      if (index < i)
+         partial_ll[index] += partial_ll[index+i] ;
+      __syncthreads() ;
+      }
+
+   if (index == 0)
+      d_mse_out[blockIdx.x] = partial_ll[0] ;
+}
+
+
+int cuda_cpx_ll (
+   int n ,          // Number of values; ncases
+   double *ll       // Computed dot product
+   )
+{
+   int i, blocks_per_grid ;
+   double sum ;
+   char msg[256] ;
+   cudaError_t error_id ;
+
+   blocks_per_grid = (n + REDUC_THREADS - 1) / REDUC_THREADS ;
+   if (blocks_per_grid > REDUC_BLOCKS)
+      blocks_per_grid = REDUC_BLOCKS ;
+
+   device_cpx_ll <<< blocks_per_grid , REDUC_THREADS >>> () ;   
+   cudaDeviceSynchronize() ;
+
+   error_id = cudaGetLastError () ;
+   error_id = cudaMemcpy ( reduc_fdata , h_mse_out , blocks_per_grid * sizeof(float) , cudaMemcpyDeviceToHost ) ;
+
+   sum = 0.0 ;
+   for (i=0 ; i<blocks_per_grid ; i++)
+      sum += reduc_fdata[i] ;
+   *ll = sum / n ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   CPX_CUDA_CLEANUP - Cleanup after CUDA CPX processing
+
+--------------------------------------------------------------------------------
+*/
+
+void cpx_cuda_cleanup ( int classifier , int n_layers )
+{
+   int ilayer ;
+   double sum ;
+   char msg[256] ;
+
+   if (h_trn_data != NULL) {
+      cudaFree ( h_trn_data ) ;
+      h_trn_data = NULL ;
+      }
+
+   if (h_targets != NULL) {
+      cudaFree ( h_targets ) ;
+      h_targets = NULL ;
+      }
+
+   if (h_class != NULL) {
+      cudaFree ( h_class ) ;
+      h_class = NULL ;
+      }
+
+   if (h_nhid != NULL) {
+      cudaFree ( h_nhid ) ;
+      h_nhid = NULL ;
+      }
+
+   if (h_nhid_cols != NULL) {
+      cudaFree ( h_nhid_cols ) ;
+      h_nhid_cols = NULL ;
+      }
+
+   if (hidden_weights != NULL) {
+      cudaFree ( hidden_weights ) ;
+      hidden_weights = NULL ;
+      }
+
+   if (h_whid != NULL) {
+      cudaFree ( h_whid ) ;
+      h_whid = NULL ;
+      }
+
+   if (h_wout != NULL) {
+      cudaFree ( h_wout ) ;
+      h_wout = NULL ;
+      }
+
+   if (activations != NULL) {
+      cudaFree ( activations ) ;
+      activations = NULL ;
+      }
+
+   if (h_act != NULL) {
+      cudaFree ( h_act ) ;
+      h_act = NULL ;
+      }
+
+   if (is_complex) {
+      if (derivs != NULL) {
+         cudaFree ( derivs ) ;
+         derivs = NULL ;
+         }
+      if (h_drr != NULL) {
+         cudaFree ( h_drr ) ;
+         h_drr = NULL ;
+         }
+      if (h_dii != NULL) {
+         cudaFree ( h_dii ) ;
+         h_dii = NULL ;
+         }
+      if (h_dri != NULL) {
+         cudaFree ( h_dri ) ;
+         h_dri = NULL ;
+         }
+      }
+
+   if (h_output != NULL) {
+      cudaFree ( h_output ) ;
+      h_output = NULL ;
+      }
+
+   if (h_this_delta != NULL) {
+      cudaFree ( h_this_delta ) ;
+      h_this_delta = NULL ;
+      }
+
+   if (h_prior_delta != NULL) {
+      cudaFree ( h_prior_delta ) ;
+      h_prior_delta = NULL ;
+      }
+
+   if (h_gradient != NULL) {
+      cudaFree ( h_gradient ) ;
+      h_gradient = NULL ;
+      }
+
+   if (h_grad_ptr != NULL) {
+      cudaFree ( h_grad_ptr ) ;
+      h_grad_ptr = NULL ;
+      }
+
+   if (h_mse_out != NULL) {
+      cudaFree ( h_mse_out ) ;
+      h_mse_out = NULL ;
+      }
+
+   if (fdata != NULL) {
+      FREE ( fdata ) ;
+      fdata = NULL ;
+      }
+
+   if (reduc_fdata != NULL) {
+      FREE ( reduc_fdata ) ;
+      reduc_fdata = NULL ;
+      }
+
+   total_memory = 0.0 ;
+
+   cudaDeviceReset () ;
+}

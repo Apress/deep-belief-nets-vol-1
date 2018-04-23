@@ -1,0 +1,500 @@
+/******************************************************************************/
+/*                                                                            */
+/*  MRFFT_K - This contains the 'kernels' routine called from MRFFT.          */
+/*                                                                            */
+/******************************************************************************/
+
+
+#if ! defined ( PI )
+#define PI 3.141592653589793
+#endif
+
+void kernels ( double *real , double *imag , int ntot , int npts , int nspan ,
+               int isign , int n_facs , double *rwork , double *iwork ,
+               double *cosines , double *sines , int *factors )
+{
+   int j, k, l, m, ibase, inner_span, full_span, facnum, itrig ;
+#if defined (_WIN64)
+   __int64 offset ;
+#else
+   int offset ;
+#endif
+   int last_point, previous_kernel, limit, kernel, inc, jump, tot_pts ;
+   double c0, s0, c1, s1, c2, s2, c3, s3, r0, i0 ;
+   double sin_third, sin_fifth, cos_fifth ;
+   double angle, rtemp, itemp, rtemp2, itemp2, temp ;
+   double real_sum, real_diff, real_sum2, real_diff2 ;
+   double imag_sum, imag_diff, imag_sum2, imag_diff2 ;
+   double *rptr0, *iptr0, *rptr1, *iptr1, *rptr2, *iptr2, *rptr3, *iptr3 ;
+   double *rptr4, *iptr4, *flagptr, *flagptr2, *endptr, *finalptr ;
+
+   inc = abs ( isign ) ;
+   tot_pts = inc * ntot ;
+   last_point = tot_pts - inc ;
+   inner_span = inc * nspan ;
+   jump = inner_span / npts ;
+
+/*
+   Compute some trig values that may be used later.
+   These are for a third and a fifth of a circle,
+   for the kernels 3 and 5, respectively.
+*/
+
+   sin_third = sin ( 2.0 * PI / 3.0 ) ;
+   sin_fifth = sin ( 2.0 * PI / 5.0 ) ;
+   cos_fifth = cos ( 2.0 * PI / 5.0 ) ;
+
+   if (isign < 0) {
+      sin_third = -sin_third ;
+      sin_fifth = -sin_fifth ;
+      }
+
+/*
+   Main Fourier loop
+*/
+
+   facnum = 0 ;            // Indexes the factors
+   previous_kernel = 0 ;   // Only recompute trig if kernel changes
+
+kernel_loop:
+   angle = 2.0 * PI * jump / (double) inner_span ;
+   if (isign < 0)
+      angle = -angle ;
+   temp = sin ( 0.5 * angle ) ;
+   c0 = 2.0 * temp * temp ;
+   s0 = sin ( angle ) ;
+   ibase = 0 ;
+   kernel = factors[facnum++] ;
+
+/*
+   Kernel of 2
+*/
+
+   if (kernel == 2) {
+      inner_span /= 2 ;
+
+      rptr0 = real ;
+      iptr0 = imag ;
+      flagptr = real + last_point ;
+      endptr = real + jump ;
+      for (;;) {
+         rptr1 = rptr0 + inner_span ;
+         temp = *rptr1 ;
+         *rptr1 = *rptr0 - temp ;
+         *rptr0 += temp ;
+         iptr1 = iptr0 + inner_span ;
+         temp = *iptr1 ;
+         *iptr1 = *iptr0 - temp ;
+         *iptr0 += temp ;
+         rptr0 = rptr1 + inner_span ;
+         iptr0 = iptr1 + inner_span ;
+         if (rptr0 < flagptr)
+            continue ;
+         rptr0 -= last_point ;
+         iptr0 -= last_point ;
+         if (rptr0 >= endptr)
+            break ;
+         }
+
+      if (rptr0 - real >= inner_span)
+         return ;
+
+      k = inner_span + 2 ;
+      for (;;) {
+         c1 = 1.0 - c0 ;
+         s1 = s0 ;
+         limit = k / 2 ;
+
+         flagptr = real + tot_pts - 1 ;
+         endptr = real + limit - jump ;
+         for (;;) {
+            rptr1 = rptr0 + inner_span ;
+            rtemp = *rptr0 - *rptr1 ;
+            *rptr0 += *rptr1 ;
+            iptr1 = iptr0 + inner_span ;
+            itemp = *iptr0 - *iptr1 ;
+            *iptr0 += *iptr1 ;
+            *rptr1 = c1 * rtemp - s1 * itemp ;
+            *iptr1 = s1 * rtemp + c1 * itemp ;
+            rptr0 += 2 * inner_span ;
+            iptr0 += 2 * inner_span ;
+            if (rptr0 < flagptr)
+               continue ;
+            offset = rptr0 - real ;
+            offset = k + tot_pts - 2 * offset - 2 ;
+            rptr0 += offset ;
+            iptr0 += offset ;
+            c1 = -c1 ;
+            if (tot_pts + offset  >  0)
+               continue ;
+            if (rptr0 >= endptr)
+               break ;
+            rptr0 += jump ;
+            iptr0 += jump ;
+            temp = c1 - (c0 * c1 + s0 * s1) ;
+            s1 = (s0 * c1 - c0 * s1) + s1 ;
+            c1 = temp ;
+            }
+
+         k += inc * 2 ;
+         ibase = (k - inner_span) / 2 + jump - 1 ;
+         if (ibase >= 2 * jump)
+            break ;
+         rptr0 = real + ibase ;
+         iptr0 = imag + ibase ;
+         }
+      } // Kernel 2
+
+/*
+   Kernel of 4
+*/
+
+   else if (kernel == 4) {
+      inner_span /= 4 ;
+
+      rptr0 = real ;
+      iptr0 = imag ;
+      finalptr = real + jump + inner_span - inc ;
+
+      for (;;) {
+         c1 = c2 = c3 = 1.0 ;
+         s1 = s2 = s3 = 0.0 ;
+
+         flagptr = real + tot_pts ;
+         endptr = real + inner_span ;
+
+         for (;;) {
+            rptr1 = rptr0 + inner_span ;
+            rptr2 = rptr1 + inner_span ;
+            rptr3 = rptr2 + inner_span ;
+            real_sum = *rptr0 + *rptr2 ;
+            real_diff = *rptr0 - *rptr2 ;
+            real_sum2 = *rptr1 + *rptr3 ;
+            real_diff2 = *rptr1 - *rptr3 ;
+            *rptr0 = real_sum + real_sum2 ;
+            real_sum2 = real_sum - real_sum2 ;
+            iptr1 = iptr0 + inner_span ;
+            iptr2 = iptr1 + inner_span ;
+            iptr3 = iptr2 + inner_span ;
+            imag_sum = *iptr0 + *iptr2 ;
+            imag_diff = *iptr0 - *iptr2 ;
+            imag_sum2 = *iptr1 + *iptr3 ;
+            imag_diff2 = *iptr1 - *iptr3 ;
+            *iptr0 = imag_sum + imag_sum2 ;
+            imag_sum2 = imag_sum - imag_sum2 ;
+            if (isign < 0) {
+               real_sum = real_diff + imag_diff2 ;
+               real_diff -= imag_diff2 ;
+               imag_sum = imag_diff - real_diff2 ;
+               imag_diff += real_diff2 ;
+               }
+            else {
+               real_sum = real_diff - imag_diff2 ;
+               real_diff += imag_diff2 ;
+               imag_sum = imag_diff + real_diff2 ;
+               imag_diff -= real_diff2 ;
+               }
+
+            *rptr1 = real_sum * c1 - imag_sum * s1 ;
+            *rptr2 = real_sum2 * c2 - imag_sum2 * s2 ;
+            *rptr3 = real_diff * c3 - imag_diff * s3 ;
+            *iptr1 = real_sum * s1 + imag_sum * c1 ;
+            *iptr2 = real_sum2 * s2 + imag_sum2 * c2 ;
+            *iptr3 = real_diff * s3 + imag_diff * c3 ;
+
+            rptr0 += 4 * inner_span ;
+            iptr0 += 4 * inner_span ;
+            if (rptr0 < flagptr)
+               continue ;
+
+            rptr0 += jump - tot_pts ;
+            iptr0 += jump - tot_pts ;
+            if (rptr0 >= endptr)
+               break ;
+
+            temp = c1 - (c0 * c1 + s0 * s1) ;
+            s1 = (s0 * c1 - c0 * s1) + s1 ;
+            c1 = temp ;
+            c2 = c1 * c1 - s1 * s1 ;
+            s2 = 2.0 * c1 * s1 ;
+            c3 = c2 * c1 - s2 * s1 ;
+            s3 = c2 * s1 + s2 * c1 ;
+            }
+
+         if (rptr0 >= finalptr)
+            break ;
+         rptr0 += inc - inner_span ;
+         iptr0 += inc - inner_span ;
+         }
+
+      if (inner_span == jump)
+         return ;
+      }
+
+/*
+   All odd kernels
+*/
+
+   else {
+      full_span = inner_span ;
+      inner_span /= kernel ;
+
+/*
+   Kernel 3
+*/
+
+      if (kernel == 3) {
+         rptr0 = real ;
+         iptr0 = imag ;
+         flagptr = real + last_point - 1 ;
+         endptr = flagptr + inner_span + 1 ;
+         for (;;) {
+            rptr1 = rptr0 + inner_span ;
+            rptr2 = rptr1 + inner_span ;
+            rtemp = *rptr0 ;
+            real_sum = *rptr1 + *rptr2 ;
+            *rptr0 = rtemp + real_sum ;
+            rtemp -= 0.5 * real_sum ;
+            rtemp2 = (*rptr1 - *rptr2) * sin_third ;
+            iptr1 = iptr0 + inner_span ;
+            iptr2 = iptr1 + inner_span ;
+            itemp = *iptr0 ;
+            imag_sum = *iptr1 + *iptr2 ;
+            *iptr0 = itemp + imag_sum ;
+            itemp -= 0.5 * imag_sum ;
+            itemp2 = (*iptr1 - *iptr2) * sin_third ;
+            *rptr1 = rtemp - itemp2 ;
+            *rptr2 = rtemp + itemp2 ;
+            *iptr1 = itemp + rtemp2 ;
+            *iptr2 = itemp - rtemp2 ;
+            rptr0 += 3 * inner_span ;
+            iptr0 += 3 * inner_span ;
+            if (rptr0 < flagptr)
+               continue ;
+            if (rptr0 >= endptr)
+               break ;
+            rptr0 -= last_point ;
+            iptr0 -= last_point ;
+            }
+         } // If kernel == 3
+
+/*
+   Kernel 5
+*/
+
+      else if (kernel == 5) {
+         c2 = cos_fifth * cos_fifth - sin_fifth * sin_fifth ;
+         s2 = 2.0 * cos_fifth * sin_fifth ;
+         rptr0 = real ;
+         iptr0 = imag ;
+         flagptr = real + last_point - 1 ;
+         endptr = flagptr + inner_span + 1 ;
+         for (;;) {
+            rptr1 = rptr0 + inner_span ;
+            rptr2 = rptr1 + inner_span ;
+            rptr3 = rptr2 + inner_span ;
+            rptr4 = rptr3 + inner_span ;
+            real_sum = *rptr1 + *rptr4 ;
+            real_diff = *rptr1 - *rptr4 ;
+            real_sum2 = *rptr2 + *rptr3 ;
+            real_diff2 = *rptr2 - *rptr3 ;
+            r0 = *rptr0 ;
+            *rptr0 = r0 + real_sum + real_sum2 ;
+            rtemp = real_sum * cos_fifth + real_sum2 * c2 + r0 ;
+            iptr1 = iptr0 + inner_span ;
+            iptr2 = iptr1 + inner_span ;
+            iptr3 = iptr2 + inner_span ;
+            iptr4 = iptr3 + inner_span ;
+            imag_sum = *iptr1 + *iptr4 ;
+            imag_diff = *iptr1 - *iptr4 ;
+            imag_sum2 = *iptr2 + *iptr3 ;
+            imag_diff2 = *iptr2 - *iptr3 ;
+            i0 = *iptr0 ;
+            *iptr0 = i0 + imag_sum + imag_sum2 ;
+            itemp = imag_sum * cos_fifth + imag_sum2 * c2 + i0 ;
+            rtemp2 = real_diff * sin_fifth + real_diff2 * s2 ;
+            itemp2 = imag_diff * sin_fifth + imag_diff2 * s2 ;
+            *rptr1 = rtemp - itemp2 ;
+            *rptr4 = rtemp + itemp2 ;
+            *iptr1 = itemp + rtemp2 ;
+            *iptr4 = itemp - rtemp2 ;
+            rtemp = real_sum * c2 + real_sum2 * cos_fifth + r0 ;
+            itemp = imag_sum * c2 + imag_sum2 * cos_fifth + i0 ;
+            rtemp2 = real_diff * s2 - real_diff2 * sin_fifth ;
+            itemp2 = imag_diff * s2 - imag_diff2 * sin_fifth ;
+            *rptr2 = rtemp - itemp2 ;
+            *rptr3 = rtemp + itemp2 ;
+            *iptr2 = itemp + rtemp2 ;
+            *iptr3 = itemp - rtemp2 ;
+            rptr0 += 5 * inner_span ;
+            iptr0 += 5 * inner_span ;
+            if (rptr0 < flagptr)
+               continue ;
+            if (rptr0 >= endptr)
+               break ;
+            rptr0 -= last_point ;
+            iptr0 -= last_point ;
+            }
+         }
+
+/*
+   Arbitrary odd kernel
+*/
+
+      else {
+         if (kernel != previous_kernel) {  // If different from last time, compute trig
+            previous_kernel = kernel ;
+            angle = 2.0 * PI / kernel ;
+            if (isign < 0)
+               angle = -angle ;
+            c1 = cos ( angle ) ;
+            s1 = sin ( angle ) ;
+            cosines[kernel-1] = 1.0 ;
+            sines[kernel-1] = 0.0 ;
+            rptr0 = cosines ;
+            rptr1 = cosines + kernel - 1 ;
+            iptr0 = sines ;
+            iptr1 = sines + kernel - 1 ;
+            for (;;) {
+               *rptr0 = *rptr1 * c1 + *iptr1 * s1 ;
+               *iptr0 = *rptr1 * s1 - *iptr1 * c1 ;
+               *(--rptr1) = *(rptr0++) ;
+               *(--iptr1) = -*(iptr0++) ;
+               if (rptr0 >= rptr1)
+                  break ;
+               }
+            } // Compute trig if changed from last kernel
+
+         rptr0 = real ;
+         iptr0 = imag ;
+         flagptr = real + last_point ;
+         endptr = flagptr + inner_span ;
+         for (;;) {    // Trig is ready.  Do the odd kernel.
+            rptr1 = rptr0 + inner_span ;
+            rptr2 = rptr0 + full_span ;
+            rtemp = r0 = *rptr0 ;
+            iptr1 = iptr0 + inner_span ;
+            iptr2 = iptr0 + full_span ;
+            itemp = i0 = *iptr0 ;
+            rptr3 = rwork ;
+            iptr3 = iwork ;
+            for (;;) {
+               rptr2 -= inner_span ;
+               *rptr3 = *rptr1 + *rptr2 ;
+               rtemp += *(rptr3++) ;
+               *(rptr3++) = *rptr1 - *rptr2 ;
+               rptr1 += inner_span ;
+               iptr2 -= inner_span ;
+               *iptr3 = *iptr1 + *iptr2 ;
+               itemp += *(iptr3++) ;
+               *(iptr3++) = *iptr1 - *iptr2 ;
+               iptr1 += inner_span ;
+               if (rptr1 >= rptr2)
+                  break ;
+               }
+            *rptr0 = rtemp ;
+            *iptr0 = itemp ;
+            rptr1 = rptr0 + inner_span ;
+            rptr2 = rptr0 + full_span ;
+            iptr1 = iptr0 + inner_span ;
+            iptr2 = iptr0 + full_span ;
+            j = 1 ;
+            for (;;) {
+               rtemp = r0 ;
+               itemp = i0 ;
+               rtemp2 = itemp2 = 0.0 ;
+               rptr3 = rwork ;
+               iptr3 = iwork ;
+               finalptr = rwork + kernel - 1 ;
+               itrig = j - 1 ;
+               for (;;) {
+                  rtemp += *(rptr3++) * cosines[itrig] ;
+                  rtemp2 += *(rptr3++) * sines[itrig] ;
+                  itemp += *(iptr3++) * cosines[itrig] ;
+                  itemp2 += *(iptr3++) * sines[itrig] ;
+                  if (rptr3 >= finalptr)
+                     break ;
+                  itrig = (itrig + j) % kernel ;
+                  }
+               rptr2 -= inner_span ;
+               iptr2 -= inner_span ;
+               *rptr1 = rtemp - itemp2 ;
+               *rptr2 = rtemp + itemp2 ;
+               *iptr1 = itemp + rtemp2 ;
+               *iptr2 = itemp - rtemp2 ;
+               if (2 * (++j) > kernel)
+                  break ;
+               rptr1 += inner_span ;
+               iptr1 += inner_span ;
+               }
+            rptr0 += full_span ;
+            iptr0 += full_span ;
+            if (rptr0 < flagptr)
+               continue ;
+            if (rptr0 >= endptr)
+               break ;
+            rptr0 -= last_point ;
+            iptr0 -= last_point ;
+            }
+         } // Else arbitrary odd kernel
+
+      if (facnum == n_facs)
+         return ;
+
+/*
+   Multiply by rotation factor
+*/
+
+      rptr0 = real + jump ;
+      iptr0 = imag + jump ;
+      j = inner_span - tot_pts ;
+      k = full_span + tot_pts - jump ;
+      l = inner_span - k ;
+      m = jump + inc - k ;
+      flagptr = real + tot_pts ;
+      flagptr2 = real + k ;
+      endptr = real + full_span - j ;
+      finalptr = real + full_span + tot_pts - inc ;
+
+      for (;;) {
+         c2 = 1.0 - c0 ;
+         s1 = s0 ;
+
+         for (;;) {
+            c1 = c2 ;
+            s2 = s1 ;
+            rptr0 += inner_span ;
+            iptr0 += inner_span ;
+            for (;;) {
+               rtemp = *rptr0 ;
+               *rptr0 = c2 * rtemp - s2 * *iptr0 ;
+               *iptr0 = s2 * rtemp + c2 * *iptr0 ;
+               rptr0 += full_span ;
+               iptr0 += full_span ;
+               if (rptr0 < flagptr)
+                  continue ;
+               rtemp = s1 * s2 ;
+               s2 = s1 * c2 + c1 * s2 ;
+               c2 = c1 * c2 - rtemp ;
+               if (rptr0 >= endptr)
+                  break ;
+               rptr0 += j ;
+               iptr0 += j ;
+               }
+            if (rptr0 >= flagptr2)
+               break ;
+            rptr0 += l ;
+            iptr0 += l ;
+            c2 = c1 - (c0 * c1 + s0 * s1) ;
+            s1 += (s0 * c1 - c0 * s1) ;
+            }
+
+         if (rptr0 >= finalptr)
+            break ;
+         rptr0 += m ;
+         iptr0 += m ;
+         }
+      } // All odd factors
+
+   goto kernel_loop ;
+}
